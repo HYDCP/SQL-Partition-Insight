@@ -10,6 +10,8 @@
 python -m pip install -r requirements.txt
 ```
 
+版本统一以 `requirements.txt` 中的固定版本为准；修改版本后需重新执行上述安装命令。`--check` 会核对并显示实际安装的 SQLGlot 版本。
+
 ## 配置与运行
 
 首次运行先创建本地配置，再编辑 `config/config.json`：

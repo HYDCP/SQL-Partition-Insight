@@ -3,7 +3,6 @@ import json
 from .paths import resolve_path
 from .ingestion.mysql import mysql_queries
 from .partitioning.catalog import PartitionCatalog
-from .partitioning.importer import load_metadata
 
 def load_config(config_path, source_type=None):
     config = json.loads(config_path.read_text(encoding='utf-8-sig'))
@@ -49,6 +48,7 @@ def validate(config, base):
     if partition['format'] == 'config_json':
         PartitionCatalog.from_path(resolve_path(base, partition['path']))
     else:
+        from .partitioning.importer import load_metadata
         load_metadata(resolve_path(base, partition['path']))
     output = config.get('output')
     if not isinstance(output, dict) or not isinstance(output.get('directory'), str) or not output['directory'].strip():

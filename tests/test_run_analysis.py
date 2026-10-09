@@ -64,6 +64,33 @@ class TableCursor(Cursor):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_version_check_follows_edited_requirements_and_reports_installed_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'partitions.json').write_text('{"version":1,"tables":{}}')
+            path = root / 'config.json'
+            path.write_text(json.dumps({
+                'version': 1, 'source': {'type': 'mysql', 'mysql': self.config()},
+                'partition': {'format': 'config_json', 'path': 'partitions.json'},
+                'output': {'directory': 'runs'}}))
+            requirements = root / 'requirements.txt'
+            requirements.write_text('SQLGlot == 26.9.1  # deployment pin\nPyMySQL==1.1.1\n')
+            with patch('sql_partition_analysis.pipeline.PROJECT_ROOT', root), \
+                    patch('sqlglot.__version__', '26.9.2'), \
+                    patch('sql_partition_analysis.pipeline.stream_mysql') as transport:
+                with self.assertRaises(ValueError) as failure:
+                    run(path, check_only=True)
+                message = str(failure.exception)
+                self.assertIn('要求 sqlglot==26.9.1', message)
+                self.assertIn('实际安装 26.9.2', message)
+                self.assertNotIn('26.9.0', message)
+                requirements.write_text('sqlglot==26.9.2\n')
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertIsNone(run(path, check_only=True))
+                self.assertIn('SQLGlot=26.9.2', output.getvalue())
+                transport.assert_not_called()
+            self.assertFalse((root / 'runs').exists())
+
     def test_multiple_tables_allow_empty_table_and_preserve_duplicates(self):
         row = self.row()
         row[2] = None

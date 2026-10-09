@@ -11,6 +11,7 @@ import uuid
 import zipfile
 
 from .configuration import load_config, validate
+from .dependencies import check_sqlglot
 from .paths import PROJECT_ROOT, REPORTING_ROOT, resolve_path, remove_if_exists, subprocess_env
 from .ingestion.mysql import stream_mysql, mysql_tables
 from .reporting.access_data import ACCESS_FILES
@@ -39,17 +40,13 @@ def run(config_path, check_only=False, source_type=None):
     config_path = config_path.resolve()
     base = config_path.parent
     config = load_config(config_path, source_type)
+    sqlglot_version = check_sqlglot(PROJECT_ROOT / 'requirements.txt')
     validate(config, base)
-    if importlib.util.find_spec('sqlglot') is None:
-        raise ValueError('缺少 sqlglot，请先安装 requirements.txt')
-    import sqlglot
-    if sqlglot.__version__ != '26.9.0':
-        raise ValueError('请使用 requirements.txt 指定的 sqlglot==26.9.0')
     if config['source']['type'] == 'mysql' and importlib.util.find_spec('pymysql') is None:
         raise ValueError('缺少 PyMySQL，请先安装 requirements.txt')
     node = node_binary(config, base) if config['output'].get('xlsx', False) else None
     if check_only:
-        print(f"配置与本地依赖检查通过；来源={config['source']['type']}；未连接 MySQL、未导出数据")
+        print(f"配置与本地依赖检查通过；来源={config['source']['type']}；SQLGlot={sqlglot_version}；未连接 MySQL、未导出数据")
         return None
     output_parent = resolve_path(base, config['output']['directory'])
     output_parent.mkdir(parents=True, exist_ok=True)
