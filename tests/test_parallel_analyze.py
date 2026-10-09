@@ -14,14 +14,14 @@ from sql_partition_analysis.stages.parallel_analyze import automatic_workers, cp
 
 class ParallelAnalysisTests(unittest.TestCase):
     def test_automatic_worker_count_respects_available_cpus_and_fallback(self):
-        module = 'sql_partition_analysis.stages.parallel_analyze.os'
-        with patch('sql_partition_analysis.stages.parallel_analyze.cpu_quota', return_value=None):
+        module = 'sql_partition_analysis.partitioning.parallel.os'
+        with patch('sql_partition_analysis.partitioning.parallel.cpu_quota', return_value=None):
             with patch(module + '.sched_getaffinity', return_value={0, 1, 2}, create=True):
                 self.assertEqual(automatic_workers(), 3)
             for cpus, expected in ((12, 12), (128, 32), (None, 1)):
                 with patch(module + '.sched_getaffinity', side_effect=OSError, create=True), patch(module + '.cpu_count', return_value=cpus):
                     self.assertEqual(automatic_workers(), expected)
-        with patch(module + '.sched_getaffinity', return_value=set(range(8)), create=True), patch('sql_partition_analysis.stages.parallel_analyze.cpu_quota', return_value=2):
+        with patch(module + '.sched_getaffinity', return_value=set(range(8)), create=True), patch('sql_partition_analysis.partitioning.parallel.cpu_quota', return_value=2):
             self.assertEqual(automatic_workers(), 2)
 
     def test_cgroup_v1_v2_quota_and_unlimited(self):

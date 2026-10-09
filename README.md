@@ -22,6 +22,7 @@ cp config/config.example.json config/config.json
 
 - `source.csv.path`：输入 CSV 路径。
 - `source.mysql`：数据库连接信息；`table` 填日志表名列表，按整表读取并合并统计。
+- `source.mysql.batch_rows`：每批读取行数，默认 5,000，允许 1 至 100,000。
 - `partition.path`：分区清单路径。
 - `output.directory`：结果保存目录。
 
@@ -35,6 +36,10 @@ python run_analysis.py --source mysql --config config/config.json
 追加 `--check` 可只检查配置和依赖。每次运行在输出目录下生成独立子目录，包含 CSV 和 `统计结果.zip`。
 
 CSV 使用标准 33 列日志格式，时间、用户名、SQL 分别在第 1、3、22 列；MySQL 按 `column1` 至 `column33` 读取。
+
+MySQL 使用独立的批次处理链路：流式读取一批日志后立即累计次数、时间并解析首次出现的 SQL/用户组合，处理完再读取下一批；不生成 `源日志.csv`，不调用 CSV 的扫描或阶段脚本。所有配置表只读取一遍，跨批次和跨表的重复日志仍完整计数。SQL 解析、分区统计规则和报表格式由两种模式共享。
+
+MySQL 在内存中保存不同 SQL/用户组合及其解析结果；原始 33 列数据仅保留当前批次。为生成逐条映射并核对统计，临时压缩保存命中目标表的记录编号、时间和 SQL 编号，导出完成或失败时清理。最终逐条映射和访问证据仍会随命中日志条数增长；内存则随不同 SQL/用户组合数增长。
 
 另输出 `access_targets.jsonl`（访问对象）、`access_observations.jsonl.gz`（逐条访问时间及对象关联）、`access_manifest.json`（数据版本及来源），供后续热点和未访问天数分析复用。仅使用 `run_summary.json` 中 `status=complete` 的结果；分区条件尚不等同于物理分区，日志连续覆盖情况标为未知。
 
@@ -59,7 +64,7 @@ PYTHONPATH=src python -m sql_partition_analysis.metadata_import /path/to/query_r
 
 ## 项目结构
 
-代码位于 `src/sql_partition_analysis/`：`ingestion/` 读取日志，`partitioning/` 管理分区清单和 SQL 解析，`domain/` 定义访问数据格式，`analytics/` 负责统计，`reporting/` 负责导出。`stages/` 仅适配命令行阶段，`pipeline.py` 编排运行。
+代码位于 `src/sql_partition_analysis/`：`ingestion/` 读取日志，`partitioning/` 管理分区清单和 SQL 解析，`domain/` 定义访问数据格式，`analytics/` 负责统计，`reporting/` 负责导出。`pipeline.py` 选择来源并发布结果；`mysql_pipeline.py` 编排 MySQL 批次处理，`stages/` 适配 CSV 的命令行阶段。
 
 后续热点与清理建议放在 `analytics/`，复用访问数据；清理执行应作为独立模块接入。当前不执行分区删除。
 

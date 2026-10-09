@@ -13,7 +13,8 @@ import zipfile
 from .configuration import load_config, validate
 from .dependencies import check_sqlglot
 from .paths import PROJECT_ROOT, REPORTING_ROOT, resolve_path, remove_if_exists, subprocess_env
-from .ingestion.mysql import stream_mysql, mysql_tables
+from .ingestion.mysql import mysql_tables
+from .mysql_pipeline import run_mysql_analysis
 from .reporting.access_data import ACCESS_FILES
 
 DELIVERABLES = ['表分区访问统计.csv', 'SQL解析明细.csv', 'SQL原文索引.csv',
@@ -46,7 +47,7 @@ def run(config_path, check_only=False, source_type=None):
         raise ValueError('缺少 PyMySQL，请先安装 requirements.txt')
     node = node_binary(config, base) if config['output'].get('xlsx', False) else None
     if check_only:
-        print(f"配置与本地依赖检查通过；来源={config['source']['type']}；SQLGlot={sqlglot_version}；未连接 MySQL、未导出数据")
+        print(f"配置与本地依赖检查通过；来源={config['source']['type']}；SQLGlot={sqlglot_version}；未连接 MySQL、未读取数据")
         return None
     output_parent = resolve_path(base, config['output']['directory'])
     output_parent.mkdir(parents=True, exist_ok=True)
@@ -71,36 +72,44 @@ def run(config_path, check_only=False, source_type=None):
         else:
             shutil.copyfile(partition_source, partition_target)
         source = config['source']
+        env = subprocess_env(SQL_ANALYSIS_OUTPUT_DIR=str(output),
+                             SQL_ANALYSIS_PARTITION_CONFIG=str(partition_target))
         if source['type'] == 'mysql':
-            source_path = output / '源日志.csv'
-            summary['exported_rows'] = stream_mysql(source['mysql'], source_path, base)
             mysql = source['mysql']
             summary['database_tables'] = [mysql['database'] + '.' + table for table in mysql_tables(mysql)]
             source_label = 'MySQL ' + ', '.join(summary['database_tables'])
+            with (output / 'mysql_analysis.log').open('w', encoding='utf-8') as log:
+                def mysql_progress(message):
+                    line = 'PROGRESS ' + message
+                    print(line, flush=True)
+                    log.write(line + '\n')
+                    log.flush()
+                metrics = run_mysql_analysis(mysql, base, partition_target, output, source_label,
+                                             progress=mysql_progress)
+            summary['read_rows'] = metrics['source_rows']
         else:
             source_path = resolve_path(base, source['csv']['path'])
             source_label = source_path.name
-        original_stat = source_path.stat()
-        env = subprocess_env(SQL_ANALYSIS_OUTPUT_DIR=str(output),
-                   SQL_ANALYSIS_SOURCE_CSV=str(source_path),
-                   SQL_ANALYSIS_PARTITION_CONFIG=str(partition_target),
-                   SQL_ANALYSIS_SOURCE_LABEL=source_label)
-        for script in ('profile.py', 'parallel_analyze.py', 'aggregate.py', 'export_data.py'):
-            print(f'正在执行 {script}', flush=True)
-            command = [sys.executable, '-m', 'sql_partition_analysis.stages.' + script[:-3]]
-            with (output / (script + '.log')).open('w', encoding='utf-8') as log:
-                with subprocess.Popen(command, env=env, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
-                    for line in process.stdout:
-                        log.write(line)
-                        if line.startswith('PROGRESS'):
-                            print(line.rstrip(), flush=True)
-                    status = process.wait()
-            if status:
-                raise RuntimeError(f'{script} 失败，请查看 {output / (script + ".log")}')
-        current_stat = source_path.stat()
-        if (original_stat.st_size, original_stat.st_mtime_ns) != (current_stat.st_size, current_stat.st_mtime_ns):
-            raise RuntimeError('处理期间输入 CSV 发生变化，本次结果不可用，请重跑')
+            original_stat = source_path.stat()
+            env['SQL_ANALYSIS_SOURCE_CSV'] = str(source_path)
+            env['SQL_ANALYSIS_SOURCE_LABEL'] = source_label
+            for script in ('profile.py', 'parallel_analyze.py', 'aggregate.py', 'export_data.py'):
+                print(f'正在执行 {script}', flush=True)
+                command = [sys.executable, '-m', 'sql_partition_analysis.stages.' + script[:-3]]
+                with (output / (script + '.log')).open('w', encoding='utf-8') as log:
+                    with subprocess.Popen(command, env=env, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+                        for line in process.stdout:
+                            log.write(line)
+                            if line.startswith('PROGRESS'):
+                                print(line.rstrip(), flush=True)
+                        status = process.wait()
+                if status:
+                    raise RuntimeError(f'{script} 失败，请查看 {output / (script + ".log")}')
+            current_stat = source_path.stat()
+            if (original_stat.st_size, original_stat.st_mtime_ns) != (current_stat.st_size, current_stat.st_mtime_ns):
+                raise RuntimeError('处理期间输入 CSV 发生变化，本次结果不可用，请重跑')
+            metrics = json.loads((output / 'aggregate.json').read_text(encoding='utf-8'))['metrics']
         if node:
             print('正在生成 Excel', flush=True)
             with (output / 'build_report.log').open('w', encoding='utf-8') as log:
@@ -109,7 +118,6 @@ def run(config_path, check_only=False, source_type=None):
             if result.returncode:
                 raise RuntimeError(f'Excel 导出失败，请查看 {output / "build_report.log"}')
             remove_if_exists(output / '表分区访问统计.xlsx.inspect.ndjson')
-        metrics = json.loads((output / 'aggregate.json').read_text(encoding='utf-8'))['metrics']
         summary.update(status='packaging', source_rows=metrics['source_rows'],
                        tables=metrics['tables'], groups=metrics['stat_groups'],
                        completed_at=dt.datetime.now().astimezone().isoformat())

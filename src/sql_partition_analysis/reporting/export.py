@@ -1,10 +1,29 @@
 """Export human-facing reports without coupling presentation to analysis services."""
 
 def export_reports(profile, analysis, aggregate, source_path, output_path, progress=None):
+    """CSV adapter: resolve source rows to SQL IDs before neutral report export."""
+    import csv
+    from pathlib import Path
+    from sql_partition_analysis.ingestion.records import sql_identity, TIME_COLUMN
+    sql_to_id = {(s['sql'], s['user_name']): s['id'] for s in profile['sqls']}
+
+    def observations():
+        csv.field_size_limit(20_000_000)
+        with Path(source_path).open(encoding='utf-8-sig', newline='') as stream:
+            reader = csv.reader(stream)
+            next(reader)
+            for number, row in enumerate(reader, 1):
+                yield {'source_record': number, 'log_time': row[TIME_COLUMN],
+                       'sql_id': sql_to_id[sql_identity(row)]}
+
+    return export_processed_reports(profile, analysis, aggregate, observations(), output_path, progress)
+
+
+def export_processed_reports(profile, analysis, aggregate, observations, output_path, progress=None):
+    """Export processed access evidence independently of its input transport."""
     from copy import deepcopy
     import csv,json,collections,re,gzip
     from pathlib import Path
-    from sql_partition_analysis.ingestion.records import sql_identity, TIME_COLUMN, USER_COLUMN
     from .access_data import AccessDatasetWriter
     R=Path(output_path)
     G=deepcopy(aggregate);A=deepcopy(analysis);P=profile;S={s['id']:s for s in P['sqls']}
@@ -90,24 +109,26 @@ def export_reports(profile, analysis, aggregate, source_path, output_path, progr
      coverage.append([table,status,entry.get('partition_type',''),','.join(entry.get('partition_columns',[])),entry.get('partition_definition',''),sum(S[sid]['count'] for sid in ids),','.join(sorted(ids))])
     write('表分区配置核对.csv',['表名','元数据匹配状态','分区方式','分区字段','分区定义','访问日志条数_同条日志同表计一次','关联SQL编号'],coverage)
     (R/'report_data.json').write_text(json.dumps(G,ensure_ascii=False),encoding='utf8')
-    # Re-read all source records independently. Validate every final aggregate and record log-to-group links.
-    sql_to_id={(s['sql'],s['user_name']):s['id'] for s in P['sqls']};id_to_groups=collections.defaultdict(list)
+    # Reconcile occurrence evidence against every final aggregate.
+    id_to_groups=collections.defaultdict(list)
     for r in G['results']:
      for sid in r['ids']:id_to_groups[sid].append(r['group_id'])
     check={r['group_id']:{'n':0,'first':None,'last':None} for r in G['results']}
-    csv.field_size_limit(20_000_000)
-    with Path(source_path).open(encoding='utf-8-sig',newline='') as f, gzip.open(R/'逐条日志统计映射.csv.gz','wt',encoding='utf-8-sig',newline='') as out, AccessDatasetWriter(R,P,G['results'],G['partition_config']) as access_data:
-     rd=csv.reader(f);next(rd);w=csv.writer(out);w.writerow(['源数据记录序号_不含表头','日志时间_CST','SQL编号','统计组ID','日志用户名'])
-     for i,row in enumerate(rd,1):
+    with gzip.open(R/'逐条日志统计映射.csv.gz','wt',encoding='utf-8-sig',newline='') as out, AccessDatasetWriter(R,P,G['results'],G['partition_config']) as access_data:
+     w=csv.writer(out);w.writerow(['源数据记录序号_不含表头','日志时间_CST','SQL编号','统计组ID','日志用户名'])
+     for row in observations:
+      i,log_time,sid=row['source_record'],row['log_time'],row['sql_id']
       if progress and i%100000==0:progress(f'已核对 {i:,} 条源日志')
-      sid=sql_to_id[sql_identity(row)]
       gids=id_to_groups[sid]
       if not gids:continue
-      w.writerow([i,row[TIME_COLUMN],sid,','.join(gids),row[USER_COLUMN]])
-      access_data.write(i,row[TIME_COLUMN],sid,row[USER_COLUMN],gids)
+      user=S[sid]['user_name']
+      w.writerow([i,log_time,sid,','.join(gids),user])
+      access_data.write(i,log_time,sid,user,gids)
       for gid in gids:
-       c=check[gid];c['n']+=1;c['first']=row[TIME_COLUMN] if c['first'] is None else min(c['first'],row[TIME_COLUMN]);c['last']=row[TIME_COLUMN] if c['last'] is None else max(c['last'],row[TIME_COLUMN])
+       c=check[gid];c['n']+=1;c['first']=log_time if c['first'] is None else min(c['first'],log_time);c['last']=log_time if c['last'] is None else max(c['last'],log_time)
     for r in G['results']:
-     c=check[r['group_id']];assert (c['n'],c['first'],c['last'])==(r['count'],r['first'],r['last']),r
+     c=check[r['group_id']]
+     if (c['n'],c['first'],c['last'])!=(r['count'],r['first'],r['last']):
+      raise ValueError('逐条访问证据与统计组不一致：'+r['group_id'])
     access_data.finish()
     return G

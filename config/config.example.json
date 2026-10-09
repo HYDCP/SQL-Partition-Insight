@@ -11,7 +11,8 @@
       "user": "log_reader",
       "password": null,
       "database": "sql_logs",
-      "table": ["query_log_day1", "query_log_day2"]
+      "table": ["query_log_day1", "query_log_day2"],
+      "batch_rows": 5000
     }
   },
   "partition": {

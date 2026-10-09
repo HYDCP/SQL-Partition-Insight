@@ -1,4 +1,5 @@
-"""Read original log records through CSV files or the MySQL protocol."""
+"""Read bounded batches of original log records through the MySQL protocol."""
+from contextlib import closing
 import csv
 import getpass
 import os
@@ -41,8 +42,12 @@ def mysql_queries(config):
             for table in mysql_tables(config)]
 
 
-def stream_mysql(config, destination, base, connect=None, password=None):
-    """Bounded-memory transport; writes all original rows, including duplicates."""
+def iter_mysql_batches(config, base, connect=None, password=None):
+    """Yield one batch at a time; the caller processes it before the next fetch.
+
+    Closing the iterator also closes an unfinished unbuffered connection.
+    Every configured table is read once, including duplicate log records.
+    """
     queries = mysql_queries(config)
     if password is None:
         env_name = config.get('password_env', 'SQL_LOG_MYSQL_PASSWORD')
@@ -68,46 +73,67 @@ def stream_mysql(config, destination, base, connect=None, password=None):
             raise ValueError('缺少 PyMySQL，请先执行安装依赖命令') from None
         kwargs['cursorclass'] = pymysql.cursors.SSCursor
         connect = pymysql.connect
-    partial = destination.with_suffix('.csv.part')
     connection = None
+    cursor = None
     rows = 0
     try:
         connection = connect(**kwargs)
         cursor = connection.cursor()
         expected = config.get('columns', COLUMNS)
-        with partial.open('w', encoding='utf-8-sig', newline='') as stream:
-            writer = csv.writer(stream)
-            writer.writerow(COLUMNS)
-            for table, query in queries:
-                print('正在读取 MySQL 日志表：{}.{}'.format(config['database'], table), flush=True)
-                cursor.execute(query)
-                actual = [column[0] for column in cursor.description]
-                if actual != expected:
-                    raise ValueError('MySQL 表 {} 返回字段与配置不符，已停止导出'.format(table))
-                while True:
-                    batch = cursor.fetchmany(int(config.get('batch_rows', 5000)))
-                    if not batch:
-                        break
-                    for row in batch:
-                        if len(row) != 33:
-                            raise ValueError('MySQL 返回记录不是 33 列')
-                        if row[0] is None or not str(row[0]):
-                            raise ValueError('日志时间为空，无法可靠统计')
-                        writer.writerow(['' if value is None else value for value in row])
-                    previous = rows
-                    rows += len(batch)
-                    if rows // 100000 != previous // 100000:
-                        print(f'MySQL 已导出 {rows:,} 行', flush=True)
+        for table, query in queries:
+            print('正在读取 MySQL 日志表：{}.{}'.format(config['database'], table), flush=True)
+            cursor.execute(query)
+            actual = [column[0] for column in cursor.description]
+            if actual != expected:
+                raise ValueError('MySQL 表 {} 返回字段与配置不符，已停止读取'.format(table))
+            while True:
+                batch = cursor.fetchmany(int(config.get('batch_rows', 5000)))
+                if not batch:
+                    break
+                normalized = []
+                for row in batch:
+                    if len(row) != 33:
+                        raise ValueError('MySQL 返回记录不是 33 列')
+                    if row[0] is None or not str(row[0]):
+                        raise ValueError('日志时间为空，无法可靠统计')
+                    normalized.append(['' if value is None else str(value) for value in row])
+                rows += len(normalized)
+                yield normalized
+                # Release the previous batch before fetching another one.
+                del batch, normalized
         if not rows:
             raise ValueError('所选日志表均没有数据')
-        partial.replace(destination)
-        return rows
     except Exception as error:
         if password and password in str(error):
             raise RuntimeError(str(error).replace(password, '***')) from None
         raise
     finally:
-        # Do not drain an unfinished SSCursor after failure; close its connection.
+        # PyMySQL 1.1.1 cursor/result destructors otherwise try to drain an
+        # unfinished stream even after connection.close(). Abort those owned
+        # results before closing the socket; never download the remaining rows.
         if connection is not None:
+            for result in (getattr(cursor, '_result', None), getattr(connection, '_result', None)):
+                if result is not None and hasattr(result, 'unbuffered_active'):
+                    result.unbuffered_active = False
+                    result.connection = None
+            if cursor is not None and hasattr(cursor, 'connection'):
+                cursor.connection = None
             connection.close()
+
+
+def stream_mysql(config, destination, base, connect=None, password=None):
+    """Explicit CSV export helper; the MySQL analysis pipeline does not use it."""
+    partial = destination.with_suffix('.csv.part')
+    rows = 0
+    try:
+        with closing(iter_mysql_batches(config, base, connect, password)) as batches, \
+                partial.open('w', encoding='utf-8-sig', newline='') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(COLUMNS)
+            for batch in batches:
+                writer.writerows(batch)
+                rows += len(batch)
+        partial.replace(destination)
+        return rows
+    finally:
         remove_if_exists(partial)

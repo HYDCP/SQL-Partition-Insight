@@ -15,6 +15,7 @@ from unittest.mock import patch
 from sql_partition_analysis.ingestion.mysql import COLUMNS, mysql_queries, stream_mysql
 from sql_partition_analysis.configuration import load_config, validate
 from sql_partition_analysis.pipeline import run
+from sql_partition_analysis.mysql_pipeline import run_mysql_analysis
 
 
 class Cursor:
@@ -77,7 +78,7 @@ class RunnerTests(unittest.TestCase):
             requirements.write_text('SQLGlot == 26.9.1  # deployment pin\nPyMySQL==1.1.1\n')
             with patch('sql_partition_analysis.pipeline.PROJECT_ROOT', root), \
                     patch('sqlglot.__version__', '26.9.2'), \
-                    patch('sql_partition_analysis.pipeline.stream_mysql') as transport:
+                    patch('sql_partition_analysis.pipeline.run_mysql_analysis') as transport:
                 with self.assertRaises(ValueError) as failure:
                     run(path, check_only=True)
                 message = str(failure.exception)
@@ -143,9 +144,10 @@ class RunnerTests(unittest.TestCase):
                       'output': {'directory': 'runs'}}
             path = root / 'config.json'
             path.write_text(json.dumps(config))
-            def fake_transport(settings, destination, base):
-                return stream_mysql(settings, destination, base, connect=lambda **kw: conn, password='')
-            with patch('sql_partition_analysis.pipeline.stream_mysql', side_effect=fake_transport), contextlib.redirect_stdout(io.StringIO()):
+            def fake_analysis(settings, base, catalog, output, label, **kwargs):
+                return run_mysql_analysis(settings, base, catalog, output, label,
+                                          connect=lambda **kw: conn, password='', workers=1, **kwargs)
+            with patch('sql_partition_analysis.pipeline.run_mysql_analysis', side_effect=fake_analysis), contextlib.redirect_stdout(io.StringIO()):
                 output = run(path)
             rows = json.loads((output / 'aggregate.json').read_text())['results']
             self.assertEqual(len(rows), 1)

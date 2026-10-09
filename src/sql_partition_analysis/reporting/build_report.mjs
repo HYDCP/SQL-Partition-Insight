@@ -63,11 +63,11 @@ const notes=[
  ['字段识别','只解析该表配置的分区字段。不依据日期字段名或SQL中的分区操作自动认定某表有分区。'],
  ['复杂条件','元数据只有分区方式和字段，没有物理分区名或起止边界。按SQL条件统计；范围、参数、子查询、OR/NOT保留条件，不枚举物理分区。'],
  ['读写分类','INSERT/CTAS 的目标计写入，SELECT/FROM/JOIN 来源计读取；UPDATE、DELETE、COPY、表维护分别分类。'],
- ['源字段核验',`输入表头${profile.header.length}列，数据33列。按标准位置读取：第22列SQL、第1列时间、第3列用户名、第19列语句类型。`],
+ ['源字段核验',`输入字段${profile.header.length}列，数据33列。按标准位置读取：第22列SQL、第1列时间、第3列用户名、第19列语句类型。`],
  ['表范围','按SQL中的schema.表名与用户清单中的分区表精确匹配。不补schema；非分区表、未指定schema和清单外对象不纳入统计。'],
  ['缺失信息','COPY正文截断时仅确认可识别的目标表；不补造缺失正文或分区值。'],
  ['逻辑引用范围','统计SQL文本直接引用的对象，不展开视图/函数/存储过程内部，不等同执行计划中的真实物理扫描。'],
- ['追溯方式',`SQL原文索引保留命中目标表的完整SQL；逐条映射仅保存命中的${data.metrics.access_log_count}条日志与组编号，源记录序号仍沿用原CSV。`],
+ ['追溯方式',`SQL原文索引保留命中目标表的完整SQL；逐条映射仅保存命中的${data.metrics.access_log_count}条日志与组编号，源记录序号沿用输入读取顺序。`],
  ['来源',`访问日志：${profile.source?.label??'湖仓adb服务器执行日志样例.csv'}；分区配置：${data.partition_config.source?.path??'用户配置'}。`]
 ];
 const start=26;types.getRange(`A${start}:B${start+notes.length-1}`).values=notes;
@@ -77,7 +77,7 @@ const mapRows=[];
 for(const r of data.results)for(const id of r.ids){const s=sqls.get(id);mapRows.push([r.group_id,id,r.table,short(r.partition),r.role,s.count,serial(s.first_time),serial(s.last_time),s.first_record,r.raw_partition]);}
 last=sheetSetup(mapping,'访问统计与原始 SQL 对应',[
  '每行是一条 SQL 正文对一个统计组的贡献。日志贡献数保留该 SQL 在原始数据中的全部出现次数。',
- '源记录序号不含表头，按CSV逻辑记录计数；SQL中的换行不增加记录序号。',
+ '源记录序号按输入读取顺序计数；CSV不含表头，MySQL跨配置表连续编号；SQL中的换行不增加记录序号。',
  '完整 SQL 见 SQL原文索引.csv；本页用于核对分组与计数。'
 ],['统计组ID','SQL编号','表名','分区或条件摘要','访问类型','日志贡献数','首次访问（CST）','最后访问（CST）','首次源记录序号','解析条件或分区操作'],mapRows,[14,16,48,50,24,18,24,24,22,100],'SQLAccessMap');
 mapping.getRange(`D8:D${last}`).format.wrapText=true;
