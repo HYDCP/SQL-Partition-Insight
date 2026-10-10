@@ -10,11 +10,12 @@ import sys
 import uuid
 import zipfile
 
-from .configuration import load_config, validate
+from .configuration import load_config, validate, engine_type, input_options
 from .dependencies import check_sqlglot
 from .paths import PROJECT_ROOT, REPORTING_ROOT, resolve_path, remove_if_exists, subprocess_env
 from .ingestion.mysql import mysql_tables
 from .mysql_pipeline import run_mysql_analysis
+from .csv_pipeline import run_csv_analysis
 from .reporting.access_data import ACCESS_FILES
 from .reporting.partition_alerts import CHECK_NAME
 
@@ -44,6 +45,8 @@ def run(config_path, check_only=False, source_type=None):
     config = load_config(config_path, source_type)
     sqlglot_version = check_sqlglot(PROJECT_ROOT / 'requirements.txt')
     validate(config, base)
+    engine = engine_type(config)
+    log_options = input_options(config['source'])
     if config['source']['type'] == 'mysql' and importlib.util.find_spec('pymysql') is None:
         raise ValueError('缺少 PyMySQL，请先安装 requirements.txt')
     node = node_binary(config, base) if config['output'].get('xlsx', False) else None
@@ -56,6 +59,7 @@ def run(config_path, check_only=False, source_type=None):
     output = output_parent / stamp
     output.mkdir()
     summary = {'status': 'running', 'source_type': config['source']['type'],
+               'engine_type': engine, 'log_format': log_options['log_format'],
                'started_at': dt.datetime.now().astimezone().isoformat(), 'xlsx': bool(node)}
     def save_summary():
         (output / 'run_summary.json').write_text(
@@ -76,7 +80,7 @@ def run(config_path, check_only=False, source_type=None):
         env = subprocess_env(SQL_ANALYSIS_OUTPUT_DIR=str(output),
                              SQL_ANALYSIS_PARTITION_CONFIG=str(partition_target))
         if source['type'] == 'mysql':
-            mysql = source['mysql']
+            mysql = dict(source['mysql'], **log_options)
             summary['database_tables'] = [mysql['database'] + '.' + table for table in mysql_tables(mysql)]
             source_label = 'MySQL ' + ', '.join(summary['database_tables'])
             with (output / 'mysql_analysis.log').open('w', encoding='utf-8') as log:
@@ -86,31 +90,23 @@ def run(config_path, check_only=False, source_type=None):
                     log.write(line + '\n')
                     log.flush()
                 metrics = run_mysql_analysis(mysql, base, partition_target, output, source_label,
-                                             progress=mysql_progress)
+                                             progress=mysql_progress, engine=engine)
             summary['read_rows'] = metrics['source_rows']
         else:
             source_path = resolve_path(base, source['csv']['path'])
             source_label = source_path.name
             original_stat = source_path.stat()
-            env['SQL_ANALYSIS_SOURCE_CSV'] = str(source_path)
-            env['SQL_ANALYSIS_SOURCE_LABEL'] = source_label
-            for script in ('profile.py', 'parallel_analyze.py', 'aggregate.py', 'export_data.py'):
-                print(f'正在执行 {script}', flush=True)
-                command = [sys.executable, '-m', 'sql_partition_analysis.stages.' + script[:-3]]
-                with (output / (script + '.log')).open('w', encoding='utf-8') as log:
-                    with subprocess.Popen(command, env=env, cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
-                        for line in process.stdout:
-                            log.write(line)
-                            if line.startswith('PROGRESS'):
-                                print(line.rstrip(), flush=True)
-                        status = process.wait()
-                if status:
-                    raise RuntimeError(f'{script} 失败，请查看 {output / (script + ".log")}')
+            with (output / 'csv_analysis.log').open('w', encoding='utf-8') as log:
+                def csv_progress(message):
+                    line = 'PROGRESS ' + message
+                    print(line, flush=True)
+                    log.write(line + '\n')
+                    log.flush()
+                metrics = run_csv_analysis(source_path, partition_target, output, source_label,
+                                           progress=csv_progress, engine=engine, **log_options)
             current_stat = source_path.stat()
             if (original_stat.st_size, original_stat.st_mtime_ns) != (current_stat.st_size, current_stat.st_mtime_ns):
                 raise RuntimeError('处理期间输入 CSV 发生变化，本次结果不可用，请重跑')
-            metrics = json.loads((output / 'aggregate.json').read_text(encoding='utf-8'))['metrics']
         omission_check=json.loads((output / CHECK_NAME).read_text(encoding='utf-8'))
         summary.update(partition_omission_alerts=omission_check['alert_count'],
                        partition_omission_check_file=CHECK_NAME)

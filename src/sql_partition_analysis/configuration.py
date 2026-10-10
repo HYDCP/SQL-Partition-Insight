@@ -3,6 +3,22 @@ import json
 from .paths import resolve_path
 from .ingestion.mysql import mysql_queries
 from .partitioning.catalog import PartitionCatalog
+from .engines import get_engine_adapter
+from .ingestion.formats import get_log_format
+
+
+def engine_type(config):
+    engine = config.get('engine', {'type': 'adb_pg'})
+    if not isinstance(engine, dict) or not isinstance(engine.get('type'), str):
+        raise ValueError('engine 必须是包含 type 的对象')
+    return engine['type']
+
+
+def input_options(source):
+    """Log format is independent of both the storage transport and SQL engine."""
+    if 'fields' in source:
+        raise ValueError('当前仅启用旧 33 列适配器，尚不支持 fields 字段映射')
+    return {'log_format': source.get('log_format', 'adb_legacy_33')}
 
 def load_config(config_path, source_type=None):
     config = json.loads(config_path.read_text(encoding='utf-8-sig'))
@@ -17,7 +33,10 @@ def load_config(config_path, source_type=None):
 def validate(config, base):
     if config.get('version') != 1:
         raise ValueError('配置 version 必须为 1')
+    get_engine_adapter(engine_type(config))
     source = config['source']
+    options = input_options(source)
+    get_log_format(options['log_format'])
     if source.get('type') not in ('csv', 'mysql'):
         raise ValueError('source.type 必须是 csv 或 mysql')
     if not isinstance(source.get(source['type']), dict):
@@ -29,7 +48,7 @@ def validate(config, base):
             raise ValueError('CSV 输入文件不存在')
     else:
         mysql = source['mysql']
-        mysql_queries(mysql)
+        mysql_queries(dict(mysql, **options))
         if not mysql.get('host') or not mysql.get('user'):
             raise ValueError('请填写 mysql.host 和 mysql.user')
         if mysql.get('password') is not None and not isinstance(mysql['password'], str):

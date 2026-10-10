@@ -8,6 +8,21 @@ import sys
 
 from ..paths import resolve_path, remove_if_exists
 from .records import COLUMNS
+from .formats import get_log_format
+
+
+def mysql_columns(config):
+    if 'fields' in config:
+        raise ValueError('当前仅支持旧 33 列日志格式，尚不支持 fields 映射')
+    adapter = get_log_format(config.get('log_format', 'adb_legacy_33'))
+    fields = config.get('columns', adapter.columns)
+    if not isinstance(fields, list) or not fields or len(set(fields)) != len(fields):
+        raise ValueError('mysql.columns 必须列出不同的字段名')
+    adapter.validate_projection(fields)
+    for field in fields:
+        identifier(field)
+    adapter.validate_header(fields)
+    return fields
 
 def identifier(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value):
@@ -31,9 +46,7 @@ def mysql_tables(config):
 def mysql_queries(config):
     if any(key in config for key in ('start_date', 'end_date_exclusive', 'date_column')):
         raise ValueError('日期筛选配置已移除，请删除 start_date/end_date_exclusive/date_column；现在按表清单读取整表')
-    fields = config.get('columns', COLUMNS)
-    if len(fields) != 33 or len(set(fields)) != 33:
-        raise ValueError('mysql.columns 必须依次列出 33 个不同字段，对应 column1 至 column33')
+    fields = mysql_columns(config)
     select = 'SELECT ' + ', '.join(map(identifier, fields)) + ' FROM '
     database = identifier(config['database'])
     order = config.get('order_by', [])
@@ -49,6 +62,10 @@ def iter_mysql_batches(config, base, connect=None, password=None):
     Every configured table is read once, including duplicate log records.
     """
     queries = mysql_queries(config)
+    adapter = get_log_format(config.get('log_format', 'adb_legacy_33'))
+    batch_rows = int(config.get('batch_rows', 5000))
+    if batch_rows <= 0:
+        raise ValueError('batch_rows 必须为正整数')
     if password is None:
         env_name = config.get('password_env', 'SQL_LOG_MYSQL_PASSWORD')
         password = os.environ.get(env_name)
@@ -79,7 +96,7 @@ def iter_mysql_batches(config, base, connect=None, password=None):
     try:
         connection = connect(**kwargs)
         cursor = connection.cursor()
-        expected = config.get('columns', COLUMNS)
+        expected = mysql_columns(config)
         for table, query in queries:
             print('正在读取 MySQL 日志表：{}.{}'.format(config['database'], table), flush=True)
             cursor.execute(query)
@@ -87,16 +104,16 @@ def iter_mysql_batches(config, base, connect=None, password=None):
             if actual != expected:
                 raise ValueError('MySQL 表 {} 返回字段与配置不符，已停止读取'.format(table))
             while True:
-                batch = cursor.fetchmany(int(config.get('batch_rows', 5000)))
+                batch = cursor.fetchmany(batch_rows)
                 if not batch:
                     break
                 normalized = []
                 for row in batch:
-                    if len(row) != 33:
-                        raise ValueError('MySQL 返回记录不是 33 列')
-                    if row[0] is None or not str(row[0]):
-                        raise ValueError('日志时间为空，无法可靠统计')
-                    normalized.append(['' if value is None else str(value) for value in row])
+                    if len(row) != len(expected):
+                        raise ValueError('MySQL 返回记录不是 {} 列'.format(len(expected)))
+                    record = ['' if value is None else str(value) for value in row]
+                    adapter.validate_row(record, rows + len(normalized) + 1, expected)
+                    normalized.append(record)
                 rows += len(normalized)
                 yield normalized
                 # Release the previous batch before fetching another one.
@@ -121,15 +138,30 @@ def iter_mysql_batches(config, base, connect=None, password=None):
             connection.close()
 
 
+def iter_mysql_event_batches(config, base, connect=None, password=None):
+    """Adapt rows without changing the historical row transport API."""
+    adapter = get_log_format(config.get('log_format', 'adb_legacy_33'))
+    header = mysql_columns(config)
+    source_record = 0
+    with closing(iter_mysql_batches(config, base, connect, password)) as batches:
+        for batch in batches:
+            events = []
+            for row in batch:
+                source_record += 1
+                events.append(adapter.to_event(row, source_record, header))
+            yield events
+
+
 def stream_mysql(config, destination, base, connect=None, password=None):
     """Explicit CSV export helper; the MySQL analysis pipeline does not use it."""
     partial = destination.with_suffix('.csv.part')
+    adapter = get_log_format(config.get('log_format', 'adb_legacy_33'))
     rows = 0
     try:
         with closing(iter_mysql_batches(config, base, connect, password)) as batches, \
                 partial.open('w', encoding='utf-8-sig', newline='') as stream:
             writer = csv.writer(stream)
-            writer.writerow(COLUMNS)
+            writer.writerow(adapter.columns)
             for batch in batches:
                 writer.writerows(batch)
                 rows += len(batch)

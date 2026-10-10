@@ -10,7 +10,8 @@ from .pipeline import run
 
 
 def main():
-    parser = argparse.ArgumentParser(description='从 CSV 或 MySQL 一键导出 SQL 表分区访问统计')
+    parser = argparse.ArgumentParser(
+        description='SQL-Partition-Insight：从 CSV 或 Doris 日志表（MySQL 协议）分析 SQL 分区访问')
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
     parser.add_argument('--source', choices=('csv', 'mysql'),
                         help='选择本次数据来源；覆盖配置 source.type，不修改配置文件')

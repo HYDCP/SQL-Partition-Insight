@@ -1,1 +1,1 @@
-"""SQL partition access analysis."""
+"""SQL-Partition-Insight: extensible SQL partition access analysis."""

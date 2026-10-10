@@ -6,7 +6,6 @@ import csv
 import io
 import json
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -80,13 +79,13 @@ class PartitionAlertExportTests(unittest.TestCase):
                     self.assertNotIn(CHECK_NAME, archive.namelist())
 
     def test_missing_mapping_warns_and_mysql_run_still_completes(self):
-        def lose_mapping(profile, analysis, catalog):
-            result = aggregate_accesses(profile, analysis, catalog)
+        def lose_mapping(profile, analysis, catalog, **kwargs):
+            result = aggregate_accesses(profile, analysis, catalog, **kwargs)
             result['mapping'].pop(0)
             return result
 
         console = io.StringIO()
-        with patch('sql_partition_analysis.mysql_pipeline.aggregate_accesses', side_effect=lose_mapping), \
+        with patch('sql_partition_analysis.batch_pipeline.aggregate_accesses', side_effect=lose_mapping), \
                 contextlib.redirect_stdout(console):
             output = self.execute('mysql')
         alerts = [json.loads(line) for line in (output / ALERTS_NAME).read_text(encoding='utf-8').splitlines()]
@@ -116,19 +115,16 @@ class PartitionAlertExportTests(unittest.TestCase):
         self.assertEqual(len(result['alerts']), 1)
         self.assertEqual((profile, report), before)
 
-    def test_csv_subprocess_warning_reaches_console_and_run_completes(self):
-        original_popen = subprocess.Popen
-
-        def damaged_export(command, **kwargs):
-            if command[-1] == 'sql_partition_analysis.stages.export_data':
-                path = Path(kwargs['env']['SQL_ANALYSIS_OUTPUT_DIR']) / 'aggregate.json'
-                aggregate = json.loads(path.read_text(encoding='utf-8'))
-                aggregate['mapping'].pop(0)
-                path.write_text(json.dumps(aggregate), encoding='utf-8')
-            return original_popen(command, **kwargs)
+    def test_csv_warning_reaches_console_and_run_completes(self):
+        # CSV now shares the event pipeline; inject the same missing mapping
+        # at its aggregation boundary rather than a removed subprocess stage.
+        def damaged_aggregate(profile, analysis, catalog, **kwargs):
+            result = aggregate_accesses(profile, analysis, catalog, **kwargs)
+            result['mapping'].pop(0)
+            return result
 
         console = io.StringIO()
-        with patch('sql_partition_analysis.pipeline.subprocess.Popen', side_effect=damaged_export), \
+        with patch('sql_partition_analysis.batch_pipeline.aggregate_accesses', side_effect=damaged_aggregate), \
                 contextlib.redirect_stdout(console):
             output = self.execute('csv')
         alerts = [json.loads(line) for line in (output / ALERTS_NAME).read_text(encoding='utf-8').splitlines()]

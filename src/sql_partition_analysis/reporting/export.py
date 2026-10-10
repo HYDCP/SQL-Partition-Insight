@@ -1,20 +1,16 @@
 """Export human-facing reports without coupling presentation to analysis services."""
 
-def export_reports(profile, analysis, aggregate, source_path, output_path, progress=None):
+def export_reports(profile, analysis, aggregate, source_path, output_path, progress=None,
+                   log_format='adb_legacy_33'):
     """CSV adapter: resolve source rows to SQL IDs before neutral report export."""
-    import csv
-    from pathlib import Path
-    from sql_partition_analysis.ingestion.records import sql_identity, TIME_COLUMN
+    from sql_partition_analysis.ingestion.csv import iter_csv_batches
     sql_to_id = {(s['sql'], s['user_name']): s['id'] for s in profile['sqls']}
 
     def observations():
-        csv.field_size_limit(20_000_000)
-        with Path(source_path).open(encoding='utf-8-sig', newline='') as stream:
-            reader = csv.reader(stream)
-            next(reader)
-            for number, row in enumerate(reader, 1):
-                yield {'source_record': number, 'log_time': row[TIME_COLUMN],
-                       'sql_id': sql_to_id[sql_identity(row)]}
+        for batch in iter_csv_batches(source_path, log_format=log_format):
+            for event in batch:
+                yield {'source_record': event.source_record, 'log_time': event.event_time,
+                       'sql_id': sql_to_id[(event.sql_text, event.user_name)]}
 
     return export_processed_reports(profile, analysis, aggregate, observations(), output_path, progress)
 

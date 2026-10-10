@@ -68,7 +68,7 @@ const notes=[
  ['缺失信息','COPY正文截断时仅确认可识别的目标表；不补造缺失正文或分区值。'],
  ['逻辑引用范围','统计SQL文本直接引用的对象，不展开视图/函数/存储过程内部，不等同执行计划中的真实物理扫描。'],
  ['追溯方式',`SQL原文索引保留命中目标表的完整SQL；逐条映射仅保存命中的${data.metrics.access_log_count}条日志与组编号，源记录序号沿用输入读取顺序。`],
- ['来源',`访问日志：${profile.source?.label??'湖仓adb服务器执行日志样例.csv'}；分区配置：${data.partition_config.source?.path??'用户配置'}。`]
+ ['来源',`访问日志：${profile.source?.label??'输入日志'}；分区配置：${data.partition_config.source?.path??'用户配置'}。`]
 ];
 const start=26;types.getRange(`A${start}:B${start+notes.length-1}`).values=notes;
 types.getRange(`A${start}:A${start+notes.length-1}`).format.font={bold:true,color:'#254564'};

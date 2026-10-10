@@ -1,7 +1,11 @@
 {
   "version": 1,
+  "engine": {
+    "type": "adb_pg"
+  },
   "source": {
     "type": "csv",
+    "log_format": "adb_legacy_33",
     "csv": {
       "path": "../data/input/query_log.csv"
     },
