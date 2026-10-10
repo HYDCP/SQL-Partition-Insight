@@ -186,6 +186,42 @@ class PartitionConstantsTests(unittest.TestCase):
                 self.assertIsNone(value(node))
                 self.assertEqual(normalize_expression(node).sql(), node.sql())
 
+    def test_interval_fields_truncate_without_changing_unqualified_intervals(self):
+        cases = [("INTERVAL '0.5' YEAR", Interval(0, 0, 0)),
+                 ("INTERVAL '-1.5' YEAR", Interval(-12, 0, 0)),
+                 ("INTERVAL '1.5' DAY", Interval(0, 1, 0)),
+                 ("INTERVAL '-1.5' DAY", Interval(0, -1, 0)),
+                 ("INTERVAL '1.5' HOUR", Interval(0, 0, 3600000000)),
+                 ("INTERVAL '-1.5' MINUTE", Interval(0, 0, -60000000)),
+                 ("INTERVAL '1.5' SECOND", Interval(0, 0, 1500000)),
+                 ("INTERVAL '0.5 years'", Interval(6, 0, 0)),
+                 ("INTERVAL '1.5 days'", Interval(0, 1, 43200000000)),
+                 ("INTERVAL '-1.5 hours'", Interval(0, 0, -5400000000)),
+                 ("INTERVAL '1.5 days' DAY", Interval(0, 1, 0)),
+                 ("CAST('0.5 years' AS INTERVAL YEAR)", Interval(0, 0, 0))]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                node = self.expression(text)
+                self.assertEqual(value(node), expected)
+                # Aggregation reparses rendered predicates; the qualifier must
+                # survive that round trip even inside an unevaluated function.
+                self.assertEqual(self.evaluate(node.sql(dialect='postgres')), expected)
+        for text in ("INTERVAL '1-2' YEAR TO MONTH", "INTERVAL '1 02:03' DAY TO MINUTE"):
+            with self.subTest(text=text):
+                node = self.expression(text)
+                self.assertIsNone(value(node))
+                self.assertIsNone(self.evaluate(node.sql(dialect='postgres')))
+        for text in ("INTERVAL '1e2' DAY", "INTERVAL '1.5' SECOND(0)",
+                     "CAST('1.5' AS INTERVAL DAY TO SECOND(2))"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.evaluate(text))
+
+    def test_interval_qualifier_survives_unknown_expression_normalization(self):
+        text = "COALESCE(INTERVAL '0.5' YEAR, dynamic_interval)"
+        normalized = normalize_expression(self.expression(text)).sql(dialect='postgres')
+        self.assertIn('AS INTERVAL YEAR', normalized)
+        self.assertIsNone(self.evaluate(normalized))
+
     def test_predicate_folds_typed_values_without_mutating_input(self):
         node = self.expression("data_dt = DATE '20260901' - 1 AND code = '20260901'")
         original = node.sql()

@@ -2,6 +2,7 @@
 import _support
 import ast
 from pathlib import Path
+import sys
 import unittest
 
 from sqlglot import exp
@@ -274,7 +275,13 @@ class ParserPreprocessingTests(unittest.TestCase):
     def test_source_is_python37_compatible(self):
         root = Path(__file__).resolve().parents[1] / "src/sql_partition_analysis/partitioning"
         for name in ("parser.py", "preprocessing.py"):
-            ast.parse((root / name).read_text(), feature_version=(3, 7))
+            source = (root / name).read_text(encoding='utf-8')
+            if sys.version_info[:2] == (3, 7):
+                # Python 3.7 itself is the grammar check; feature_version was
+                # introduced later and must not prevent native 3.7 test runs.
+                ast.parse(source)
+            else:
+                ast.parse(source, feature_version=(3, 7))
 
 
 if __name__ == "__main__":

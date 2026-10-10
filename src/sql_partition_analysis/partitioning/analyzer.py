@@ -26,13 +26,33 @@ def analyze_profile(profile, catalog):
      if schema in ('pg_catalog','information_schema','gp_toolkit') or (not schema and name.startswith('pg_')):return '系统对象'
      if schema:return '显式schema对象'
      return '临时表候选/未指定schema'
+    def parse_statement(statement):
+     alter=parse_alter(statement)
+     if alter is not None:return [('alter',alter[0],alter[1])]
+     return [normalize_identifiers(t,dialect='postgres') for t in parse_postgres(statement) if t is not None]
     def parse_trees(text):
-     trees=[]
+     trees=[];notes=[]
      for statement in split_sql_statements(text):
-      alter=parse_alter(statement)
-      if alter is not None:trees.append(('alter',alter[0],alter[1]))
-      else:trees.extend(normalize_identifiers(t,dialect='postgres') for t in parse_postgres(statement) if t is not None)
-     return trees
+      try:
+       parsed=parse_statement(statement)
+      except Exception:
+       # Recover within this statement so one unsupported COPY cannot consume
+       # preceding or following SQL, or reset its table occurrence numbering.
+       parsed=None;recovered=recover_identifier_quote_encoding(statement)
+       if recovered is not None:
+        try:
+         recovered,recovery_notes=prepare_sql(recovered)
+         candidate=parse_statement(recovered)
+         if candidate and not any(isinstance(t,exp.Command) for t in candidate):
+          parsed=candidate;notes.extend(recovery_notes)
+          notes.append('仅解析时按完整标识符双重引号编码兼容还原；原始SQL保留')
+        except Exception:pass
+       if parsed is None:
+        copy=recover_copy_header(statement)
+        if copy is None:raise
+        parsed=[('copy',)+copy]
+      trees.extend(parsed)
+     return trees,notes
     DETAIL=[];PRED=[];INDEX=[];UNRES=[]
     for s in P['sqls']:
      raw=s['sql'];sid=s['id'];statistics_eligible=True
@@ -47,39 +67,40 @@ def analyze_profile(profile, catalog):
       meta['status']='非SQL日志消息';INDEX.append(meta);continue
      # Tokenize statements before dispatch: DDL must not consume a following query.
      try:
-      trees=parse_trees(text)
+      trees,recovery_notes=parse_trees(text)
+      notes.extend(recovery_notes);meta['notes']='; '.join(dict.fromkeys(notes))
      except Exception as e:
-      recovered=recover_identifier_quote_encoding(text)
-      trees=None
+      # An encoded identifier may itself contain a semicolon. Recover the
+      # whole quote frame before retrying statement boundaries in that case.
+      trees=None;recovered=recover_identifier_quote_encoding(text)
       if recovered is not None:
        try:
         recovered,recovery_notes=prepare_sql(recovered)
-        trees=parse_trees(recovered)
-        if not trees or any(isinstance(t,exp.Command) for t in trees):trees=None
-        else:
-         text=recovered;notes.extend(recovery_notes)
+        candidate,statement_notes=parse_trees(recovered)
+        if candidate and not any(isinstance(t,exp.Command) for t in candidate):
+         trees=candidate;notes.extend(recovery_notes+statement_notes)
          notes.append('仅解析时按完整标识符双重引号编码兼容还原；原始SQL保留')
          meta['notes']='; '.join(dict.fromkeys(notes))
-       except Exception:trees=None
+       except Exception:pass
       if trees is None:
-       copy=recover_copy_header(text)
-       if copy:
-        t,direction,incomplete=copy;name=ident_name(t)
-        if t.meta.get('identifier_quote_recovery'):
-         notes.append('仅解析时按完整COPY对象标识符双重引号编码兼容还原；截断字段列表和原始SQL保留')
-         meta['notes']='; '.join(dict.fromkeys(notes))
-        reason='字段列表或COPY头部未完整记录，方向和分区值未知' if incomplete else 'COPY语法未完全展开；仅保留完整目标和明确方向证据'
-        detail={'id':sid,'occurrence':1,'table':name,'category':category(t),'role':direction or 'COPY方向未知','alias':'','candidates':'','all_conditions':'','status':reason,'notes':'未补造数据正文；分区值未知'}
-        if not statistics_eligible:detail['statistics_eligible']=False
-        DETAIL.append(detail)
-        meta['status']='部分解析（COPY截断）' if incomplete else '部分解析（COPY语法）'
-        meta['tables']=[name];meta['notes']+='; '+reason;INDEX.append(meta);continue
        meta['status']='解析失败';meta['notes']+='; '+re.sub(r'\x1b\[[0-9;]*m','',str(e))[:500];INDEX.append(meta);continue
+     copies=[t for t in trees if isinstance(t,tuple) and t[0]=='copy']
      if any(isinstance(t,exp.Command) and t.name.upper() not in ('SHOW','SET','BEGIN','START','END') for t in trees):meta['status']='语法未展开'
+     elif copies:meta['status']='部分解析（COPY截断）' if any(t[3] for t in copies) else '部分解析（COPY语法）'
      elif trees and all(isinstance(t,tuple) for t in trees):meta['status']='已解析（显式DDL）'
      else:meta['status']='已解析'
      occnum=0
      for tree in trees:
+      if isinstance(tree,tuple) and tree[0]=='copy':
+       _,t,direction,incomplete=tree;occnum+=1;name=ident_name(t)
+       if t.meta.get('identifier_quote_recovery'):
+        notes.append('仅解析时按完整COPY对象标识符双重引号编码兼容还原；截断字段列表和原始SQL保留')
+       reason='字段列表或COPY头部未完整记录，方向和分区值未知' if incomplete else 'COPY语法未完全展开；仅保留完整目标和明确方向证据'
+       notes.append(reason);meta['notes']='; '.join(dict.fromkeys(notes))
+       detail={'id':sid,'occurrence':occnum,'table':name,'category':category(t),'role':direction or 'COPY方向未知','alias':'','candidates':'','all_conditions':'','status':reason,'notes':'未补造数据正文；分区值未知'}
+       if not statistics_eligible:detail['statistics_eligible']=False
+       DETAIL.append(detail);meta['tables'].append(name)
+       continue
       if isinstance(tree,tuple):
        _,t,part=tree;occnum+=1
        name=ident_name(t)

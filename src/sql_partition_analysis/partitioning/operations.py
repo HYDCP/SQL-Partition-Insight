@@ -64,16 +64,26 @@ def recover_copy_header(text):
             tokens = _tokens(_complete_lexical_prefix(text))
         except Exception:
             return None
-    if len(tokens) < 2 or not _word(tokens[0], 'COPY') or tokens[1].token_type == TokenType.L_PAREN:
+    # Recovery concerns only the first statement; a later statement cannot
+    # complete a truncated relation, column group or direction in this one.
+    tokens = tokens[:next((index for index, token in enumerate(tokens)
+                           if token.token_type == TokenType.SEMICOLON), len(tokens))]
+    if len(tokens) < 2 or not _word(tokens[0], 'COPY'):
         return None
-    index = 2
+    # PostgreSQL still accepts the legacy COPY BINARY table FROM/TO syntax.
+    # Only an unquoted keyword is a modifier: COPY "binary" names a table.
+    first = 2 if _word(tokens[1], 'BINARY') else 1
+    if (first >= len(tokens) or tokens[first].token_type == TokenType.L_PAREN
+            or any(_word(tokens[first], word) for word in ('FROM', 'TO'))):
+        return None
+    index = first + 1
     while index + 1 < len(tokens) and tokens[index].token_type == TokenType.DOT:
         index += 2
     if index < len(tokens) and tokens[index].token_type == TokenType.DOT:
         # A qualified target may have more components after the final dot.
         # Its shorter prefix is not evidence of a complete relation.
         return None
-    name = text[tokens[1].start:tokens[index - 1].end + 1]
+    name = text[tokens[first].start:tokens[index - 1].end + 1]
     try:
         table = normalize_identifiers(sqlglot.parse_one('SELECT * FROM ' + name, read='postgres'), dialect='postgres').find(exp.Table)
         if table is None or not isinstance(table.this, exp.Identifier):
@@ -82,7 +92,7 @@ def recover_copy_header(text):
             # An encoded relation begins with an empty quoted token in the
             # normal lexer. Recover only its complete head, never a truncated
             # field list or data body. The caller must expose this assumption.
-            boundary = _copy_relation_end(tokens, text)
+            boundary = _copy_relation_end(tokens, text, first)
             head = recover_identifier_quote_encoding(text[:boundary]) if boundary is not None else None
             if head is None:
                 return None
@@ -106,9 +116,9 @@ def recover_copy_header(text):
     return table, None, False
 
 
-def _copy_relation_end(tokens, text):
+def _copy_relation_end(tokens, text, first=1):
     """Locate a complete relation without reading words inside encoded names."""
-    index, end = 1, None
+    index, end = first, None
     while index < len(tokens):
         token = tokens[index]
         if token.token_type == TokenType.IDENTIFIER and not token.text:

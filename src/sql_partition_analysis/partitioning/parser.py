@@ -22,6 +22,39 @@ _INTERVAL = re.compile(
     r'([+-]?\d+(?:\.\d+)?)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND|MILLISECOND|MICROSECOND)S?',
     re.IGNORECASE,
 )
+_INTERVAL_FIELDS = {'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'}
+_INTERVAL_STRINGS = frozenset(Postgres.Parser.STRING_PARSERS) | {TokenType.BYTE_STRING}
+
+
+def _interval_field_end(tokens, start):
+    """Find explicit interval fields, excluding quoted aliases.
+
+    SQLGlot's PostgreSQL generator folds Interval.unit into the string, which
+    loses the truncation semantics of an explicit YEAR/DAY/etc. qualifier.
+    Represent these forms as equivalent typed CASTs so serialization retains
+    their meaning. Precision is preserved, but remains outside the evaluator.
+    """
+    def field(index):
+        return (index < len(tokens) and tokens[index].token_type not in
+                (TokenType.STRING, TokenType.IDENTIFIER, TokenType.HEREDOC_STRING)
+                and tokens[index].text.upper() in _INTERVAL_FIELDS)
+
+    if not field(start):
+        return None
+    end = start
+    if (end + 1 < len(tokens) and tokens[end + 1].token_type == TokenType.VAR
+            and tokens[end + 1].text.upper() == 'TO'):
+        if not field(end + 2):
+            return None
+        end += 2
+    if end + 1 < len(tokens) and tokens[end + 1].token_type == TokenType.L_PAREN:
+        if (tokens[end].text.upper() != 'SECOND' or end + 3 >= len(tokens)
+                or tokens[end + 2].token_type != TokenType.NUMBER
+                or not re.fullmatch(r'[0-9]+', tokens[end + 2].text)
+                or tokens[end + 3].token_type != TokenType.R_PAREN):
+            return None
+        end += 3
+    return end
 
 
 def _preserve_function_arguments(name, builder, supported_count, template_index=None):
@@ -77,6 +110,28 @@ class CompatiblePostgres(LexicalPostgres):
                 template_index=1 if _function_name in ("TO_DATE", "TO_TIMESTAMP") else None,
             )
         del _function_name
+
+        def _parse_types(self, check_func=False, schema=False, allow_identifiers=True):
+            datatype = super()._parse_types(check_func, schema, allow_identifiers)
+            if not isinstance(datatype, exp.DataType) or not isinstance(datatype.this, exp.Interval):
+                return datatype
+            unit = datatype.this.args.get('unit')
+            last = unit.expression if isinstance(unit, exp.IntervalSpan) else unit
+            if (isinstance(last, exp.Var) and last.name == 'SECOND'
+                    and self._curr and self._curr.token_type == TokenType.L_PAREN):
+                # SQLGlot 26.9 omits the precision suffix on interval fields.
+                # Keep it in native renderable nodes, so reparsing cannot turn
+                # an unproved rounded interval into an unrestricted constant.
+                precision = self._parse_wrapped(self._parse_number)
+                if (not isinstance(precision, exp.Literal) or precision.is_string
+                        or not re.fullmatch(r'[0-9]+', precision.this)):
+                    self.raise_error('Expected integer interval precision')
+                qualified = self.expression(exp.Anonymous, this='SECOND', expressions=[precision])
+                if isinstance(unit, exp.IntervalSpan):
+                    unit.set('expression', qualified)
+                else:
+                    datatype.this.set('unit', qualified)
+            return datatype
 
         def _parse_create(self):
             # Activate the Greenplum format grammar only for a complete external
@@ -311,6 +366,14 @@ def compatible_postgres(sql):
     edits = []
     for index, token in enumerate(tokens[:-1]):
         literal = tokens[index + 1]
+        if token.token_type == TokenType.INTERVAL and literal.token_type in _INTERVAL_STRINGS:
+            field_end = _interval_field_end(tokens, index + 2)
+            if field_end is not None:
+                edits.append((token.start, tokens[field_end].end + 1,
+                              'CAST(' + sql[token.end + 1:literal.end + 1]
+                              + ' AS INTERVAL' + sql[literal.end + 1:tokens[field_end].end + 1]
+                              + ') '))
+                continue
         if literal.token_type != TokenType.STRING:
             continue
         if token.token_type == TokenType.INTERVAL:

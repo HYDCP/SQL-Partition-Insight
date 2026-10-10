@@ -179,6 +179,8 @@ def _cast(node):
         return None
     kind = target.this
     item = value(node.this)
+    if isinstance(kind, exp.Interval):
+        return _qualified_interval(item, kind.args.get('unit'))
     if kind == exp.DataType.Type.DATE:
         return _as_date(item)
     if kind == exp.DataType.Type.TIMESTAMP:
@@ -211,6 +213,38 @@ def _cast(node):
     if kind == exp.DataType.Type.INTERVAL and isinstance(item, str):
         return _interval(item, None)
     return None
+
+
+def _qualified_interval(item, field):
+    """Apply a single explicit interval field's truncation toward zero.
+
+    INTERVAL '0.5 years' has six months, whereas INTERVAL '0.5' YEAR has
+    zero years. Ranges/precision and unproved input formats stay unknown.
+    """
+    if not isinstance(field, exp.Var) or not isinstance(item, str):
+        return None
+    unit = field.name.upper()
+    if unit not in ('YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'):
+        return None
+    text = item.strip(_ASCII_SPACE)
+    # Interval input does not accept NUMERIC's exponent notation.
+    numeric = re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)', text)
+    interval = _interval(text, unit if numeric else None)
+    if interval is None:
+        return None
+
+    def truncate(number, quantum):
+        return (1 if number >= 0 else -1) * (abs(number) // quantum) * quantum
+
+    months, days, micros = interval
+    if unit == 'YEAR':
+        return Interval(truncate(months, 12), 0, 0)
+    if unit == 'MONTH':
+        return Interval(months, 0, 0)
+    if unit == 'DAY':
+        return Interval(months, days, 0)
+    quantum = {'HOUR': 3600000000, 'MINUTE': 60000000, 'SECOND': 1}[unit]
+    return Interval(months, days, truncate(micros, quantum))
 
 
 def _truncate(node):

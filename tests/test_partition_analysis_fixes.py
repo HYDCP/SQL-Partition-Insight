@@ -55,6 +55,99 @@ class PartitionAnalysisFixesTests(unittest.TestCase):
             table, role, incomplete = result
             self.assertEqual((table.db, table.name, role, incomplete), ('audit', 'events', expected, False))
 
+    def test_legacy_binary_copy_retains_real_table_and_access_direction(self):
+        for direction, endpoint, expected in [('FROM', 'STDIN', 'COPY写入'),
+                                               ('TO', 'STDOUT', 'COPY读取')]:
+            statement = 'COPY /* format */ BINARY audit.events {} {}'.format(direction, endpoint)
+            with self.subTest(direction=direction):
+                table, role, incomplete = recover_copy_header(statement)
+                self.assertEqual((table.db, table.name, role, incomplete),
+                                 ('audit', 'events', expected, False))
+                analysis, aggregate = self.analyze(statement)
+                self.assertEqual(analysis['index'][0]['tables'], ['audit.events'])
+                self.assertEqual([(row['table'], row['role']) for row in aggregate['results']],
+                                 [('audit.events', expected)])
+
+    def test_binary_copy_modifier_does_not_consume_quoted_relation_names(self):
+        for relation, schema in [('"binary"', ''), ('"binary".events', 'binary'),
+                                 ('audit."binary"', 'audit')]:
+            with self.subTest(relation=relation):
+                table, role, incomplete = recover_copy_header('COPY ' + relation + ' FROM STDIN')
+                self.assertEqual((table.db, table.name, role, incomplete),
+                                 (schema, 'events' if schema == 'binary' else 'binary', 'COPY写入', False))
+        table, role, incomplete = recover_copy_header('COPY BINARY audit."binary" TO STDOUT')
+        self.assertEqual((table.db, table.name, role, incomplete), ('audit', 'binary', 'COPY读取', False))
+
+    def test_binary_copy_recovers_encoded_names_without_guessing_truncated_objects(self):
+        for relation, expected in [('""audit"".""events""', ('audit', 'events')),
+                                   ('""audit"".""events;archive""', ('audit', 'events;archive'))]:
+            with self.subTest(relation=relation):
+                table, role, incomplete = recover_copy_header(
+                    'COPY BINARY ' + relation + " FROM STDIN WITH DELIMITER 'unterminated")
+                self.assertEqual((table.db, table.name, role, incomplete), (*expected, 'COPY写入', False))
+                self.assertTrue(table.meta['identifier_quote_recovery'])
+        for statement in ('COPY BINARY', 'COPY BINARY FROM STDIN', 'COPY BINARY TO STDOUT',
+                          'COPY BINARY audit.', 'COPY BINARY audit.events."unfinished',
+                          'COPY BINARY ""audit"".""unfinished',
+                          'COPY BINARY (SELECT * FROM audit.events) TO STDOUT'):
+            with self.subTest(statement=statement):
+                self.assertIsNone(recover_copy_header(statement))
+        table, role, incomplete = recover_copy_header('COPY BINARY audit.events(data_dt,')
+        self.assertEqual((table.db, table.name, role, incomplete), ('audit', 'events', None, True))
+
+    def test_binary_copy_recovery_does_not_read_the_next_statement_as_its_header(self):
+        for statement in ('COPY BINARY; SELECT * FROM audit.events',
+                          'COPY BINARY audit.; SELECT * FROM audit.events'):
+            with self.subTest(statement=statement):
+                self.assertIsNone(recover_copy_header(statement))
+        for statement in ('COPY BINARY audit.events; SELECT * FROM audit.other',
+                          'COPY BINARY audit.events(data_dt; SELECT 1) TO STDOUT'):
+            with self.subTest(statement=statement):
+                table, role, incomplete = recover_copy_header(statement)
+                self.assertEqual((table.db, table.name, role, incomplete), ('audit', 'events', None, True))
+        table, role, incomplete = recover_copy_header(
+            'COPY BINARY audit.events FROM STDIN; COPY audit.other TO STDOUT')
+        self.assertEqual((table.db, table.name, role, incomplete), ('audit', 'events', 'COPY写入', False))
+
+    def test_binary_copy_recovery_preserves_other_statements_and_occurrences(self):
+        statement = ("SELECT * FROM audit.events WHERE data_dt=1; "
+                     "COPY BINARY audit.events FROM STDIN; "
+                     "COPY BINARY audit.events TO STDOUT; "
+                     "SELECT * FROM audit.events WHERE data_dt=2")
+        analysis, aggregate = self.analyze(statement)
+        self.assertEqual(analysis['index'][0]['status'], '部分解析（COPY语法）')
+        self.assertEqual([(row['occurrence'], row['role']) for row in analysis['details']],
+                         [(1, '读取'), (2, 'COPY写入'), (3, 'COPY读取'), (4, '读取')])
+        self.assertEqual({(row['occurrence'], row['partition']) for row in aggregate['mapping']
+                          if row['role'] == '查询读取'}, {(1, 'data_dt=1'), (4, 'data_dt=2')})
+        self.assertEqual({row['role'] for row in aggregate['mapping']},
+                         {'查询读取', 'COPY写入', 'COPY读取'})
+
+    def test_multistatement_copy_recovery_keeps_quote_notes_and_failed_execution_exclusion(self):
+        statement = ('COPY BINARY ""audit"".""events"" FROM STDIN; '
+                     'SELECT * FROM ""audit"".""events"" WHERE ""data_dt""=2')
+        analysis, aggregate = self.analyze(statement)
+        self.assertEqual([row['table'] for row in analysis['details']], ['audit.events', 'audit.events'])
+        self.assertIn('双重引号编码兼容还原', analysis['index'][0]['notes'])
+        self.assertTrue(any(row['partition'] == 'data_dt=2' for row in aggregate['mapping']))
+        failed, failed_aggregate = self.analyze(
+            'An exception was encountered during the execution of statement: ' + statement)
+        self.assertEqual(len(failed['details']), 2)
+        self.assertTrue(all(not row['statistics_eligible'] for row in failed['details']))
+        self.assertIn('双重引号编码兼容还原', failed['index'][0]['notes'])
+        self.assertEqual(failed_aggregate['results'], [])
+
+    def test_copy_recovery_preserves_semicolons_inside_encoded_identifiers(self):
+        statement = ('COPY BINARY audit.events FROM STDIN; '
+                     'SELECT * FROM ""audit"".""events;archive"" WHERE data_dt=3')
+        analysis, aggregate = self.analyze(statement, tables={
+            'audit.events': {'partition_columns': ['data_dt']},
+            'audit.events;archive': {'partition_columns': ['data_dt']}})
+        self.assertEqual([(row['table'], row['occurrence']) for row in analysis['details']],
+                         [('audit.events', 1), ('audit.events;archive', 2)])
+        self.assertIn(('audit.events;archive', 'data_dt=3'),
+                      {(row['table'], row['partition']) for row in aggregate['results']})
+
     def test_copy_incomplete_column_list_has_unknown_direction(self):
         for statement in ('COPY audit.events(data_dt,', 'COPY audit.events(data_dt,"unfinished'):
             table, role, incomplete = recover_copy_header(statement)
