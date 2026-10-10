@@ -34,6 +34,50 @@ class PartitionConstantsTests(unittest.TestCase):
         self.assertEqual(self.evaluate(text), Decimal(text))
         self.assertEqual(render_value(self.evaluate(text)), text)
 
+    def test_numeric_text_keeps_scale_and_normalizes_zero_sign(self):
+        self.assertEqual(self.evaluate('CAST(1.50 AS TEXT)'), '1.50')
+        self.assertEqual(self.evaluate('CAST(-0.00 AS TEXT)'), '0.00')
+        self.assertEqual(self.evaluate("CAST('-0.00' AS TEXT)"), '-0.00')
+        self.assertEqual(self.evaluate('CAST(1.00 AS INTEGER)'), 1)
+        self.assertIsNone(self.evaluate('CAST(1.50 AS INTEGER)'))
+
+    def test_explicit_integer_width_controls_overflow_and_promotion(self):
+        for text in ("-CAST('-32768' AS SMALLINT)", "-CAST('-2147483648' AS INTEGER)",
+                     "-CAST('-9223372036854775808' AS BIGINT)",
+                     'CAST(32767 AS SMALLINT) + CAST(1 AS SMALLINT)',
+                     'CAST(-32768 AS SMALLINT) - CAST(1 AS SMALLINT)',
+                     "CAST(-CAST('-32768' AS SMALLINT) AS BIGINT)"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.evaluate(text))
+        for text, expected in [("-CAST('-32767' AS SMALLINT)", 32767),
+                               ('CAST(32767 AS SMALLINT) + 1', 32768),
+                               ('CAST(2147483647 AS BIGINT) + 1', 2147483648),
+                               ('CAST(1 AS BIGINT) - CAST(2147483647 AS INTEGER) - 2', -2147483648),
+                               ('-2147483648', -2147483648),
+                               ('-(-2147483648)', 2147483648),
+                               ('-(-9223372036854775808)', Decimal('9223372036854775808')),
+                               ('-(-(-9223372036854775808))', -9223372036854775808)]:
+            with self.subTest(text=text):
+                self.assertEqual(self.evaluate(text), expected)
+
+    def test_numeric_cast_input_requires_ascii_digits_and_whitespace(self):
+        for text in ("CAST('١' AS INTEGER)", "CAST('١.٥' AS NUMERIC)",
+                     "CAST('\u00a01' AS INTEGER)", "CAST('\u00a01.5' AS NUMERIC)",
+                     "TRY_CAST('7' AS INTEGER)"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.evaluate(text))
+        self.assertEqual(self.evaluate("CAST('  +01  ' AS INTEGER)"), 1)
+        self.assertEqual(self.evaluate("CAST('  +01.50  ' AS NUMERIC)"), Decimal('1.50'))
+
+    def test_numeric_storage_bounds_are_checked_before_rendering(self):
+        for text in ("CAST('1e-16384' AS NUMERIC)", "CAST('0e-16384' AS NUMERIC)",
+                     "CAST('1e131072' AS NUMERIC)",
+                     "CAST(CAST('1e-16384' AS NUMERIC) AS TEXT)"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.evaluate(text))
+        self.assertEqual(self.evaluate("CAST('1e-16383' AS NUMERIC)"), Decimal('1e-16383'))
+        self.assertEqual(self.evaluate("CAST('1e131071' AS NUMERIC)"), Decimal('1e131071'))
+
     def test_explicit_date_and_integer_arithmetic(self):
         for text in ("DATE '20260901'", "CAST('2026-09-01' AS DATE)", "DATE('20260901')"):
             self.assertEqual(self.evaluate(text), datetime.date(2026, 9, 1))

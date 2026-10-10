@@ -72,6 +72,54 @@ class PartitionOperationsTests(unittest.TestCase):
         for statement in ("CREATE TABLE s.events(data_dt) AS SELECT DATE '2026-09-01'", "CREATE TABLE s.events AS SELECT DATE '2026-09-01' AS data_dt"):
             self.assertEqual([field for field, _, _ in self.assignments(statement)], ["data_dt"])
 
+    def test_update_tuple_single_row_subquery_retains_target_positions(self):
+        expected = [("data_dt", "2", 0), ("id", "9", 0)]
+        for values in ("(SELECT 2, 9)", "((SELECT 2 AS dt, 9 AS row_id))",
+                       "(VALUES (2, 9))"):
+            with self.subTest(values=values):
+                self.assertEqual(self.assignments(
+                    "UPDATE s.events SET (data_dt,id)=" + values + " WHERE data_dt=1"), expected)
+        self.assertEqual(self.assignments(
+            "UPDATE s.events SET (data_dt,id)=(SELECT DATE '2026-10-08',9)"),
+            [("data_dt", "CAST('2026-10-08' AS DATE)", 0), ("id", "9", 0)])
+
+    def test_update_tuple_subqueries_with_unproved_cardinality_stay_unknown(self):
+        unknown = (
+            "(SELECT 2)", "(SELECT 2,9,10)", "(SELECT 2,9 FROM s.src)",
+            "(SELECT 2,9 WHERE FALSE)", "(SELECT 2,9 HAVING FALSE)",
+            "(SELECT 2,9 GROUP BY 1,2)", "(SELECT 2,9 LIMIT 0)",
+            "(SELECT 2,9 OFFSET 1)", "(WITH c AS (SELECT 1) SELECT 2,9)",
+            "(SELECT 2,9 UNION ALL SELECT 3,10)", "(VALUES (2,9),(3,10))",
+            "(SELECT generate_series(2,3),9)", "(SELECT COUNT(*),9)",
+            "(SELECT SUM(2) OVER (),9)", "(SELECT (SELECT 2),9)",
+            "(SELECT src.data_dt,9)", "(SELECT CAST('bad' AS INTEGER),9)",
+        )
+        for values in unknown:
+            with self.subTest(values=values):
+                self.assertEqual(self.assignments(
+                    "UPDATE s.events SET (data_dt,id)=" + values + " WHERE data_dt=1"), [])
+
+    def test_update_single_row_subquery_produces_old_and_new_partition_evidence(self):
+        from sql_partition_analysis.partitioning.analyzer import analyze_profile
+        from sql_partition_analysis.partitioning.catalog import PartitionCatalog
+        from sql_partition_analysis.analytics.aggregation import aggregate_accesses
+
+        catalog = PartitionCatalog({'version': 1, 'tables': {
+            's.events': {'partition_columns': ['data_dt'], 'partition_type': 'LIST'}}})
+        for values in ("(SELECT 2,9)", "(VALUES (2,9))"):
+            with self.subTest(values=values):
+                profile = {'widths': {'fixture': 1}, 'sqls': [{
+                    'id': 'Q1', 'sql': 'UPDATE s.events SET (data_dt,id)=' + values + ' WHERE data_dt=1',
+                    'count': 1, 'first_time': '2026-10-10 00:00:00',
+                    'last_time': '2026-10-10 00:00:00', 'user_name': 'audit'}]}
+                analysis = analyze_profile(profile, catalog)
+                report = aggregate_accesses(profile, analysis, catalog)
+                self.assertEqual({(row['role'], row['partition_identity']) for row in report['mapping']}, {
+                    ('UPDATE更新', ('values', (('data_dt', 'number', '1'),))),
+                    ('UPDATE更新', ('values', (('data_dt', 'number', '2'),)))})
+                self.assertTrue(any('UPDATE旧分区' in row['basis'] for row in report['mapping']))
+                self.assertTrue(any('UPDATE新分区' in row['basis'] for row in report['mapping']))
+
 
 if __name__ == "__main__":
     unittest.main()

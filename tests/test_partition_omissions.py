@@ -242,6 +242,156 @@ class PartitionOmissionTests(unittest.TestCase):
         alert, = self.check(sql, output([('number', rounded)]))['alerts']
         self.assertEqual(alert['partition_value'], {'type': 'number', 'value': exact})
 
+    def test_scalar_casts_have_independent_exact_type_and_scale_oracles(self):
+        examples = [
+            ("CAST('001' AS INTEGER)", 'number', '1'),
+            ("CAST('1.5' AS NUMERIC)", 'number', '1.5'),
+            ('CAST(1.50 AS TEXT)', 'string', '1.50'),
+            ("CAST(CAST('001' AS INTEGER) AS TEXT)", 'string', '1'),
+            ("CAST(CAST('001.500' AS NUMERIC) AS VARCHAR)", 'string', '1.500'),
+            ('CAST(1.000 AS INTEGER)', 'number', '1'),
+            ("CAST('-32768' AS SMALLINT)", 'number', '-32768'),
+            ("CAST('9223372036854775807' AS BIGINT)", 'number', '9223372036854775807'),
+            ('CAST(-0.00 AS TEXT)', 'string', '0.00'),
+        ]
+        for expression, kind, value in examples:
+            with self.subTest(expression=expression):
+                sql = 'SELECT * FROM s.events WHERE data_dt=' + expression
+                self.assertFalse(self.check(sql, output([(kind, value)]))['alerts'])
+                legacy_unknown = output([])
+                for row in legacy_unknown['mapping'] + legacy_unknown['results']:
+                    row['partition_identity'] = ('mixed', (), ('unexpanded CAST',))
+                alert, = self.check(sql, legacy_unknown)['alerts']
+                self.assertEqual(alert['partition_value'], {'type': kind, 'value': value})
+        scaled = 'SELECT * FROM s.events WHERE data_dt=CAST(1.50 AS TEXT)'
+        self.assertTrue(self.check(scaled, output([('string', '1.5')]))['alerts'])
+
+    def test_unproved_cast_rounding_precision_bounds_and_session_semantics_skip(self):
+        expressions = [
+            'CAST(1.5 AS INTEGER)', "CAST('1.0' AS INTEGER)",
+            "CAST('32768' AS SMALLINT)", "CAST('-2147483649' AS INTEGER)",
+            "CAST('9223372036854775808' AS BIGINT)",
+            "CAST('1.5' AS NUMERIC(10,2))", 'CAST(1.50 AS VARCHAR(1))',
+            'CAST(CAST(1.50 AS DOUBLE PRECISION) AS TEXT)',
+            "CAST(DATE '20261007' AS TEXT)",
+            "CAST(TIMESTAMP '2026-10-07 12:00:00' AS TEXT)",
+            "CAST('NaN' AS NUMERIC)", "TRY_CAST('001' AS INTEGER)",
+        ]
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                checked = self.check('SELECT * FROM s.events WHERE data_dt=' + expression)
+                self.assertFalse(checked['alerts'])
+                self.assertEqual(checked['metrics']['expected_accesses'], 0)
+
+    def test_unary_negation_preserves_explicit_integer_width(self):
+        valid = [
+            ("-CAST('-32767' AS SMALLINT)", '32767'),
+            ("-CAST('32767' AS SMALLINT)", '-32767'),
+            ("-CAST('-2147483647' AS INTEGER)", '2147483647'),
+            ("-CAST('-9223372036854775807' AS BIGINT)", '9223372036854775807'),
+            ("-CAST(CAST('-32768' AS SMALLINT) AS INTEGER)", '32768'),
+            ("-CAST(CAST('-2147483648' AS INTEGER) AS BIGINT)", '2147483648'),
+            ("-CAST(CAST('-9223372036854775808' AS BIGINT) AS NUMERIC)", '9223372036854775808'),
+        ]
+        for expression, value in valid:
+            with self.subTest(expression=expression):
+                sql = 'SELECT * FROM s.events WHERE data_dt=' + expression
+                self.assertFalse(self.check(sql, output([('number', value)]))['alerts'])
+                alert, = self.check(sql)['alerts']
+                self.assertEqual(alert['partition_value']['value'], value)
+        invalid = [
+            "-CAST('-32768' AS SMALLINT)",
+            "-CAST('-2147483648' AS INTEGER)",
+            "-CAST('-9223372036854775808' AS BIGINT)",
+            "-CAST(CAST('-32768' AS INTEGER) AS SMALLINT)",
+            "CAST(-CAST('-2147483648' AS INTEGER) AS BIGINT)",
+        ]
+        for expression in invalid:
+            with self.subTest(expression=expression):
+                checked = self.check('SELECT * FROM s.events WHERE data_dt=' + expression)
+                self.assertFalse(checked['alerts'])
+                self.assertEqual(checked['metrics']['expected_accesses'], 0)
+
+    def test_numeric_storage_bounds_skip_before_rendering_large_values(self):
+        import sqlglot
+        from sql_partition_analysis.validation.partition_omissions import _scalar
+        invalid = ["CAST('1e-16384' AS NUMERIC)", "CAST('0e-16384' AS NUMERIC)",
+                   "CAST('1e131072' AS NUMERIC)", '1e-16384', '0e-16384', '1e131072',
+                   "CAST(CAST('1e-16384' AS NUMERIC) AS TEXT)"]
+        for expression in invalid:
+            with self.subTest(expression=expression):
+                checked = self.check('SELECT * FROM s.events WHERE data_dt=' + expression)
+                self.assertFalse(checked['alerts'])
+                self.assertEqual(checked['metrics']['expected_accesses'], 0)
+        # Inspect short Decimal exponents directly, keeping boundary tests from
+        # constructing or printing 131,072-digit partition presentation labels.
+        for expression, exponent in [("CAST('1e131071' AS NUMERIC)", 131071),
+                                     ("CAST('1e-16383' AS NUMERIC)", -16383),
+                                     ("CAST('0e-16383' AS NUMERIC)", -16383)]:
+            with self.subTest(expression=expression):
+                scalar = _scalar(sqlglot.parse_one(expression, read='postgres'))
+                self.assertEqual(scalar[0], 'number')
+                self.assertEqual(scalar[1].as_tuple().exponent, exponent)
+        text = "SELECT * FROM s.events WHERE data_dt=CAST('1e-16384' AS TEXT)"
+        self.assertFalse(self.check(text, output([('string', '1e-16384')]))['alerts'])
+
+    def test_tuple_update_single_constant_row_detects_missing_new_value(self):
+        for source in ['(SELECT 2,9)', '(VALUES (2,9))', '(2,9)',
+                       "(SELECT CAST('002' AS INTEGER) AS dt,9 AS id)"]:
+            with self.subTest(source=source):
+                sql = 'UPDATE s.events SET (data_dt,id)=' + source + ' WHERE data_dt=1'
+                alert, = self.check(sql, output([('number', '1')], role='UPDATE更新'))['alerts']
+                self.assertEqual(alert['partition_value'], {'type': 'number', 'value': '2'})
+                self.assertEqual(alert['origin'], 'UPDATE SET')
+                self.assertFalse(self.check(sql, output([('number', '1'), ('number', '2')], role='UPDATE更新'))['alerts'])
+
+    def test_tuple_update_source_cardinality_or_nonconstant_projection_is_not_guessed(self):
+        sources = [
+            '(SELECT 2,9 FROM s.plain)', '(SELECT 2,9 WHERE FALSE)',
+            '(SELECT 2,COUNT(*))', '(SELECT 2,ROW_NUMBER() OVER ())',
+            '(SELECT 2,generate_series(1,2))', '(SELECT 2,9 LIMIT 0)',
+            '(SELECT 2,9 OFFSET 1)', '(SELECT 2,9 GROUP BY 1)',
+            '(SELECT 2,9 HAVING FALSE)', '(SELECT 2,9 UNION ALL SELECT 3,8)',
+            '(WITH x AS (SELECT 1) SELECT 2,9)', '(VALUES (2,9),(3,8))',
+            '(SELECT data_dt,9)', '(SELECT 2)', '(SELECT 2,9,8)',
+            '((SELECT 2,9) LIMIT 0)', '((SELECT 2,9) OFFSET 1)',
+            '((SELECT 2,9) FETCH FIRST 0 ROWS ONLY)',
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                sql = 'UPDATE s.events SET (data_dt,id)=' + source + ' WHERE data_dt=1'
+                checked = self.check(sql, output([('number', '1')], role='UPDATE更新'))
+                self.assertFalse(checked['alerts'])
+                self.assertEqual(checked['metrics']['expected_accesses'], 1)
+                self.assertIn('unproved_update_tuple_source', checked['metrics']['skip_reason_counts'])
+
+    def test_main_fixed_cast_and_single_row_update_results_satisfy_independent_checker(self):
+        from sql_partition_analysis.partitioning.analyzer import analyze_profile
+        from sql_partition_analysis.partitioning.catalog import PartitionCatalog
+        from sql_partition_analysis.analytics.aggregation import aggregate_accesses
+        examples = [
+            "SELECT * FROM s.events WHERE data_dt=CAST('001' AS INTEGER)",
+            "SELECT * FROM s.events WHERE data_dt=CAST('1.5' AS NUMERIC)",
+            'SELECT * FROM s.events WHERE data_dt=CAST(1.50 AS TEXT)',
+            'SELECT * FROM s.events WHERE data_dt=CAST(1.000 AS INTEGER)',
+            'SELECT * FROM s.events WHERE data_dt=CAST(-0.00 AS TEXT)',
+            'UPDATE s.events SET (data_dt,id)=(SELECT 2,9) WHERE data_dt=1',
+            'UPDATE s.events SET (data_dt,id)=(VALUES (2,9)) WHERE data_dt=1',
+        ]
+        catalog = PartitionCatalog(CONFIG)
+        for sql in examples:
+            with self.subTest(sql=sql):
+                p = profile(sql)
+                report = aggregate_accesses(p, analyze_profile(p, catalog), catalog)
+                checked = check_partition_omissions(p, report)
+                self.assertFalse(checked['alerts'])
+                if sql.startswith('UPDATE'):
+                    report['mapping'] = [row for row in report['mapping']
+                                         if ('data_dt', 'number', '2') not in row['partition_identity'][1]]
+                else:
+                    report['mapping'] = []
+                self.assertTrue(check_partition_omissions(p, report)['alerts'])
+
 
 if __name__ == '__main__':
     unittest.main()

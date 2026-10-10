@@ -22,6 +22,9 @@ _EXCEPTION = re.compile(
     r'^\s*An exception was encountered during the execution of statement:', re.I)
 _SQL_WORDS = {'SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE',
               'ALTER', 'COPY', 'TRUNCATE', 'DROP', 'ANALYZE', 'COMMENT'}
+_INTEGER_LIMITS = {exp.DataType.Type.SMALLINT: 2 ** 15,
+                   exp.DataType.Type.INT: 2 ** 31,
+                   exp.DataType.Type.BIGINT: 2 ** 63}
 
 
 class _AuditPostgres(Postgres):
@@ -129,7 +132,7 @@ def _number(text):
         value = Decimal(text)
     except (InvalidOperation, ValueError):
         return None
-    if not value.is_finite():
+    if not _numeric_storage_ok(value):
         return None
     rendered = format(value, 'f')
     if '.' in rendered:
@@ -137,30 +140,75 @@ def _number(text):
     return '0' if value == 0 else rendered
 
 
-def _constant(node):
-    """Reliable SQL-literal identity, without guessing a column's type."""
+def _numeric_storage_ok(value):
+    """An unconstrained PostgreSQL NUMERIC still has storage boundaries.
+
+    PostgreSQL numeric.c uses a 14-bit display scale and a signed int16
+    base-10000 weight. Check the short Decimal exponent before rendering.
+    https://github.com/postgres/postgres/blob/REL_12_STABLE/src/backend/utils/adt/numeric.c
+    """
+    if not value.is_finite():
+        return False
+    exponent = value.as_tuple().exponent
+    if max(0, -exponent) > 16383:
+        return False
+    if value.is_zero():
+        # Avoid assuming arbitrary positive exponent input is accepted. Zero
+        # has no physical weight, so this is a deliberate coverage restriction.
+        return exponent <= 131071
+    return value.adjusted() <= 131071
+
+
+def _explicit_integer_limit(node):
+    """Unary minus preserves the width of an explicitly typed integer input."""
+    node = _unparen(node)
+    if isinstance(node, exp.Neg):
+        return _explicit_integer_limit(node.this)
+    if type(node) is exp.Cast:
+        target = node.args.get('to')
+        if isinstance(target, exp.DataType) and not target.expressions:
+            return _INTEGER_LIMITS.get(target.this)
+    return None
+
+
+def _scalar(node):
+    """Evaluate only explicit scalar semantics, retaining numeric display scale.
+
+    The Decimal quantum is needed by numeric -> TEXT. Partition identity
+    normalization is separate and must never erase that intermediate scale.
+    """
     node = _unparen(node)
     if isinstance(node, exp.Literal):
         if node.is_string:
             return ('string', node.this)
-        value = _number(node.this)
-        return ('number', value) if value is not None else None
+        if not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', node.this):
+            return None
+        try:
+            value = Decimal(node.this)
+        except InvalidOperation:
+            return None
+        return ('number', value) if _numeric_storage_ok(value) else None
     if isinstance(node, exp.Neg):
-        value = _constant(node.this)
+        value = _scalar(node.this)
         if value and value[0] == 'number':
             # Unary minus must not round a SQL literal using Python's decimal
             # arithmetic context (whose default precision is only 28 digits).
-            return ('number', _number(str(Decimal(value[1]).copy_negate())))
+            result = value[1].copy_negate()
+            limit = _explicit_integer_limit(node.this)
+            if limit is not None and not -limit <= result < limit:
+                return None
+            return ('number', result)
         return None
-    if type(node) is exp.Cast and isinstance(node.this, exp.Literal) and node.this.is_string:
+    if type(node) is exp.Cast:
         kind = node.args.get('to')
         if (not isinstance(kind, exp.DataType) or kind.expressions
-                or any(node.args.get(key) for key in ('format', 'safe', 'action'))):
+                or any(node.args.get(key) for key in ('format', 'safe', 'action', 'default'))):
             return None
-        if kind.this == exp.DataType.Type.DATE:
+        literal_text = isinstance(node.this, exp.Literal) and node.this.is_string
+        if kind.this == exp.DataType.Type.DATE and literal_text:
             value = _date(node.this.this)
             return ('date', value) if value else None
-        if kind.this == exp.DataType.Type.TIMESTAMP:
+        if kind.this == exp.DataType.Type.TIMESTAMP and literal_text:
             text = node.this.this
             if not re.fullmatch(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?', text):
                 return None
@@ -169,9 +217,61 @@ def _constant(node):
             except ValueError:
                 return None
             return ('timestamp', value.isoformat(sep=' '))
+        child = _scalar(node.this)
+        if child is None:
+            return None
+        limits = _INTEGER_LIMITS
+        if kind.this in limits:
+            if child[0] == 'string':
+                text = child[1].strip(' \t\r\n\f\v')
+                if not re.fullmatch(r'[+-]?[0-9]+', text):
+                    return None
+                decimal = Decimal(text)
+            elif child[0] == 'number':
+                decimal = child[1]
+            else:
+                return None
+            limit = limits[kind.this]
+            if not -limit <= decimal < limit:
+                return None
+            number = int(decimal)
+            if Decimal(number) != decimal:
+                # numeric -> integer rounding is deliberately unproved.
+                return None
+            return ('number', Decimal(number))
+        if kind.this == exp.DataType.Type.DECIMAL:
+            if child[0] == 'number':
+                return child
+            if child[0] == 'string':
+                text = child[1].strip(' \t\r\n\f\v')
+                if re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', text):
+                    try:
+                        value = Decimal(text)
+                    except InvalidOperation:
+                        return None
+                    return ('number', value) if _numeric_storage_ok(value) else None
+            return None
+        if kind.this in (exp.DataType.Type.TEXT, exp.DataType.Type.VARCHAR):
+            if child[0] == 'string':
+                return child
+            if child[0] == 'number':
+                # PostgreSQL numeric output retains dscale but normalizes the
+                # sign of zero. Float/date/time conversions are not accepted.
+                value = child[1].copy_abs() if child[1].is_zero() else child[1]
+                return ('string', format(value, 'f'))
     # Functions, interval arithmetic, casts of untyped columns and session
     # dependent date/time conversions intentionally remain unproved.
     return None
+
+
+def _constant(node):
+    """Reliable typed partition identity, without guessing a column's type."""
+    result = _scalar(node)
+    if result is None:
+        return None
+    if result[0] == 'number':
+        return ('number', _number(str(result[1])))
+    return result
 
 
 def _table_name(table):
@@ -270,6 +370,34 @@ def _outer_filter(node):
             return True
         parent = parent.parent
     return False
+
+
+def _update_tuple_values(node):
+    """A positional UPDATE source must prove exactly one constant row."""
+    while isinstance(node, (exp.Paren, exp.Subquery)):
+        if any(value for key, value in node.args.items() if key != 'this'):
+            return None
+        node = node.this
+    if isinstance(node, exp.Tuple):
+        projections = node.expressions
+    elif isinstance(node, exp.Select):
+        # A bare scalar SELECT has exactly one row. Reject every query modifier
+        # rather than trying to evaluate row counts, aggregates or correlation.
+        if any(value for key, value in node.args.items() if key != 'expressions'):
+            return None
+        projections = node.expressions
+    elif isinstance(node, exp.Values):
+        if (len(node.expressions) != 1 or not isinstance(node.expressions[0], exp.Tuple)
+                or any(value for key, value in node.args.items() if key != 'expressions')):
+            return None
+        projections = node.expressions[0].expressions
+    else:
+        return None
+    if not projections:
+        return None
+    values = [_constant(value.this if isinstance(value, exp.Alias) else value)
+              for value in projections]
+    return values if all(value is not None for value in values) else None
 
 
 def _ddl_signature(text):
@@ -527,6 +655,22 @@ def _expectations(text, config):
         elif target_detail and isinstance(tree, exp.Update):
             for assignment in tree.expressions:
                 column = assignment.this if isinstance(assignment, exp.EQ) else None
+                if isinstance(column, exp.Tuple):
+                    columns = column.expressions
+                    names = [item.name for item in columns if isinstance(item, exp.Column)]
+                    if (len(names) != len(columns) or len(set(names)) != len(names)
+                            or any(item.table or item.db or item.catalog for item in columns)):
+                        skips['unproved_update_tuple_targets'] += 1
+                        continue
+                    if target_detail['partition_field'] not in names:
+                        continue
+                    values = _update_tuple_values(assignment.expression)
+                    if values is None or len(values) != len(columns):
+                        skips['unproved_update_tuple_source'] += 1
+                        continue
+                    index = names.index(target_detail['partition_field'])
+                    add(target, [values[index]], assignment.sql(dialect='postgres'), 'UPDATE SET')
+                    continue
                 if not isinstance(column, exp.Column) or column.name != target_detail['partition_field']:
                     continue
                 value = _constant(assignment.expression)
@@ -636,7 +780,8 @@ def check_partition_omissions(profile, report, progress=None):
                'skip_reason_counts': dict(sorted(skips.items()))}
     return {'checker_version': CHECKER_VERSION, 'partition_scope': 'sql_evidence',
             'coverage': {'supported': ['本地 WHERE 单字段等值和有限 IN', '显式目标列 INSERT VALUES',
-                        'UPDATE 静态分区赋值', 'ALTER 明确分区对象'],
+                        'UPDATE 静态分区赋值及无来源单行元组赋值', 'ALTER 明确分区对象',
+                        '安全整数/NUMERIC/TEXT 标量 CAST'],
                          'limitations': ['不证明物理分区或执行成功', '不下推派生表或 CTE 消费者条件',
                             '未覆盖动态、范围、OR/NOT、多重约束、COPY 正文、复杂类型转换',
                             '解析失败计入覆盖缺口；空告警不等于全部 SQL 正确']},

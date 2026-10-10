@@ -4,7 +4,7 @@ def aggregate_accesses(profile, analysis, catalog):
     import datetime,re,itertools,collections
     from dataclasses import replace
     from sql_partition_analysis.domain.partition import PartitionCandidate as Candidate
-    from decimal import Decimal, InvalidOperation
+    from decimal import Decimal
     import sqlglot
     from sqlglot import exp
     from sql_partition_analysis.partitioning.parser import parse_one_postgres
@@ -33,17 +33,13 @@ def aggregate_accesses(profile, analysis, catalog):
     def literal(node):
      """Keep SQL literal types while using the existing readable group keys."""
      node=unparen(node)
-     if isinstance(node,exp.Literal):
-      if node.is_string:return ('string',node.this)
-      try:return ('number',Decimal(node.this))
-      except InvalidOperation:return None
+     if isinstance(node,exp.Literal) and node.is_string:return ('string',node.this)
      if isinstance(node,exp.Boolean):return ('boolean',node.this)
-     if isinstance(node,exp.Neg):
-      value=literal(node.this)
-      if value and value[0]=='number':return ('number',value[1].copy_negate())
      value=constant_value(node)
      if isinstance(value,datetime.datetime):return ('timestamp',constant_text(value))
      if isinstance(value,datetime.date):return ('date',value.isoformat())
+     if isinstance(value,str):return ('string',value)
+     if isinstance(value,(int,Decimal)):return ('number',Decimal(value))
      return None
 
     def literal_text(value):

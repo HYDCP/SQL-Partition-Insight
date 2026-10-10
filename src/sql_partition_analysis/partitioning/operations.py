@@ -401,6 +401,38 @@ def _write_rows(query):
     return None
 
 
+def _single_row_update_values(query):
+    """Unwrap an UPDATE row subquery only when its single row is proved.
+
+    A FROM-free, clause-free SELECT and one VALUES tuple have fixed arity and
+    cardinality. Require reliably evaluable scalar projections as well:
+    unknown functions may return a set, and nested queries may return zero or
+    several rows. Other query forms retain the existing unknown assignment.
+    """
+    from .constants import value as constant_value
+
+    while isinstance(query, (exp.Subquery, exp.Paren)):
+        if any(item for key, item in query.args.items() if key != "this"):
+            return None
+        query = query.this
+    if isinstance(query, exp.Select):
+        if any(item for key, item in query.args.items() if key != "expressions"):
+            return None
+        values = query.expressions
+    elif isinstance(query, exp.Values):
+        if (any(item for key, item in query.args.items() if key != "expressions")
+                or len(query.expressions) != 1
+                or not isinstance(query.expressions[0], exp.Tuple)):
+            return None
+        values = query.expressions[0].expressions
+    else:
+        return None
+    values = [item.this if isinstance(item, exp.Alias) else item for item in values]
+    if not values or any(constant_value(item) is None for item in values):
+        return None
+    return values
+
+
 def write_assignments(tree):
     """Return ``[(field, expression, branch)]`` for safely mapped writes.
 
@@ -417,9 +449,13 @@ def write_assignments(tree):
                 continue
             if isinstance(assignment.this, exp.Column):
                 result.append((assignment.this.name, assignment.expression, 0))
-            elif isinstance(assignment.this, exp.Tuple) and isinstance(assignment.expression, exp.Tuple):
-                targets, values = assignment.this.expressions, assignment.expression.expressions
-                if len(targets) == len(values) and all(isinstance(x, exp.Column) for x in targets):
+            elif isinstance(assignment.this, exp.Tuple):
+                targets = assignment.this.expressions
+                values = (assignment.expression.expressions
+                          if isinstance(assignment.expression, exp.Tuple)
+                          else _single_row_update_values(assignment.expression))
+                if (values is not None and len(targets) == len(values)
+                        and all(isinstance(x, exp.Column) for x in targets)):
                     result.extend((column.name, value, 0) for column, value in zip(targets, values))
         return result
     if not isinstance(tree, (exp.Insert, exp.Create)):

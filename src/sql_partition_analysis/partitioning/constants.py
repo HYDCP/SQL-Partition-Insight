@@ -20,7 +20,11 @@ _DATE = re.compile(r"(?:\d{4}-\d{2}-\d{2}|\d{8})\Z")
 _TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2}|\d{8})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?\Z"
 )
-_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
+_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
+_ASCII_SPACE = " \t\r\n\f\v"
+_INTEGER_LIMITS = {exp.DataType.Type.SMALLINT: 2 ** 15,
+                   exp.DataType.Type.INT: 2 ** 31,
+                   exp.DataType.Type.BIGINT: 2 ** 63}
 _INTERVAL = re.compile(
     r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
     r"(years?|months?|weeks?|days?|hours?|minutes?|seconds?|milliseconds?|microseconds?)\s*\Z",
@@ -157,10 +161,19 @@ def _interval(amount, unit):
     return None
 
 
+def _decimal(text):
+    """Reject NUMERIC values outside PostgreSQL's storage bounds."""
+    result = Decimal(text)
+    if (not result.is_finite() or result.as_tuple().exponent < -16383
+            or (not result.is_zero() and result.adjusted() > 131071)):
+        return None
+    return result
+
+
 def _cast(node):
     target = node.args.get("to")
     # Length/precision, TRY_CAST and formatted CAST have additional semantics.
-    if (not isinstance(target, exp.DataType) or target.expressions
+    if (isinstance(node, exp.TryCast) or not isinstance(target, exp.DataType) or target.expressions
             or node.args.get("format") or node.args.get("safe")
             or node.args.get("action") or node.args.get("default")):
         return None
@@ -179,23 +192,22 @@ def _cast(node):
         if isinstance(item, (str, int, Decimal)):
             return render_value(item)
         return None
-    integer_limits = {exp.DataType.Type.SMALLINT: 2 ** 15,
-                      exp.DataType.Type.INT: 2 ** 31,
-                      exp.DataType.Type.BIGINT: 2 ** 63}
-    if kind in integer_limits:
+    if kind in _INTEGER_LIMITS:
         if isinstance(item, int):
             result = item
-        elif isinstance(item, str) and re.fullmatch(r"\s*[+-]?\d+\s*", item):
+        elif (isinstance(item, Decimal) and -_INTEGER_LIMITS[kind] <= item < _INTEGER_LIMITS[kind]
+              and item == item.to_integral_value()):
+            result = int(item)
+        elif isinstance(item, str) and re.fullmatch(r"[+-]?[0-9]+", item.strip(_ASCII_SPACE)):
             result = int(item)
         else:
             return None
-        limit = integer_limits[kind]
+        limit = _INTEGER_LIMITS[kind]
         return result if -limit <= result < limit else None
     if kind == exp.DataType.Type.DECIMAL and isinstance(item, (str, int, Decimal)):
-        text = str(item).strip()
+        text = str(item).strip(_ASCII_SPACE)
         if _NUMBER.fullmatch(text):
-            result = Decimal(text)
-            return result if result.is_finite() else None
+            return _decimal(text)
     if kind == exp.DataType.Type.INTERVAL and isinstance(item, str):
         return _interval(item, None)
     return None
@@ -244,6 +256,45 @@ def _shift(item, interval):
     return item + datetime.timedelta(days=interval.days, microseconds=interval.microseconds)
 
 
+def _signed_integer_literal(node):
+    """Fold a pure literal/sign/parenthesis chain as PostgreSQL's parser does."""
+    sign = 1
+    while isinstance(node, (exp.Paren, exp.Neg)):
+        if isinstance(node, exp.Neg):
+            sign = -sign
+        node = node.this
+    if isinstance(node, exp.Literal) and not node.is_string and re.fullmatch(r"[+-]?[0-9]+", str(node.this)):
+        return sign * int(node.this)
+    return None
+
+
+def _integer_limit(node):
+    """Keep PostgreSQL integer widths through the supported scalar operators.
+
+    A small value explicitly cast to BIGINT still uses BIGINT operators; two
+    SMALLINT operands use SMALLINT addition. Literal integers default to INT,
+    then BIGINT, then NUMERIC. Unknown types must not acquire a guessed width.
+    """
+    literal = _signed_integer_literal(node)
+    if literal is not None:
+        return next((limit for limit in (2 ** 31, 2 ** 63) if -limit <= literal < limit), None)
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if type(node) is exp.Cast:
+        target = node.args.get("to")
+        return _INTEGER_LIMITS.get(target.this) if isinstance(target, exp.DataType) else None
+    if isinstance(node, exp.Neg):
+        return _integer_limit(node.this)
+    if isinstance(node, (exp.Add, exp.Sub)):
+        left, right = _integer_limit(node.this), _integer_limit(node.expression)
+        if left is not None and right is not None:
+            return max(left, right)
+        if isinstance(node, exp.Sub) and all(type(value(child)) is datetime.date
+                                            for child in (node.this, node.expression)):
+            return 2 ** 31
+    return None
+
+
 def _arithmetic(node):
     left, right = value(node.this), value(node.expression)
     sign = -1 if isinstance(node, exp.Sub) else 1
@@ -266,11 +317,8 @@ def _arithmetic(node):
         return right + datetime.timedelta(days=left)
     if isinstance(left, int) and isinstance(right, int):
         result = left + sign * right
-        # PostgreSQL's integer arithmetic can overflow rather than widen.
-        limit = 2 ** 31 if all(-2 ** 31 <= part < 2 ** 31 for part in (left, right)) else 2 ** 63
-        if all(-2 ** 63 <= part < 2 ** 63 for part in (left, right)):
-            return result if -limit <= result < limit else None
-        return result
+        limit = _integer_limit(node)
+        return result if limit is not None and -limit <= result < limit else None
     return None
 
 
@@ -290,11 +338,10 @@ def value(node):
             if node.is_string:
                 return node.this
             text = str(node.this)
-            if re.fullmatch(r"[+-]?\d+", text):
+            if re.fullmatch(r"[+-]?[0-9]+", text):
                 return int(text)
             if _NUMBER.fullmatch(text):
-                result = Decimal(text)
-                return result if result.is_finite() else None
+                return _decimal(text)
             return None
         if isinstance(node, exp.Cast):
             return _cast(node)
@@ -310,12 +357,20 @@ def value(node):
         if isinstance(node, exp.Interval):
             return _interval(value(node.this), _unit(node.args.get("unit")))
         if isinstance(node, exp.Neg):
+            literal = _signed_integer_literal(node)
+            if literal is not None:
+                # Repeated signs on a literal fold before choosing its type.
+                return literal if _integer_limit(node) is not None else Decimal(literal)
             item = value(node.this)
             if isinstance(item, Interval):
                 return Interval(*(-part for part in item))
             if isinstance(item, Decimal):
                 return item.copy_negate()
-            return -item if isinstance(item, int) else None
+            if isinstance(item, int):
+                result = -item
+                limit = _integer_limit(node)
+                return result if limit is not None and -limit <= result < limit else None
+            return None
         if isinstance(node, (exp.Add, exp.Sub)):
             return _arithmetic(node)
     except (ValueError, TypeError, OverflowError, InvalidOperation):
@@ -331,7 +386,8 @@ def render_value(item):
     if isinstance(item, datetime.date):
         return item.isoformat()
     if isinstance(item, Decimal):
-        return format(item, "f")
+        # PostgreSQL numeric text preserves scale, with a positive zero sign.
+        return format(item.copy_abs() if item == 0 else item, "f")
     if isinstance(item, Interval):
         return "{} months {} days {} microseconds".format(*item)
     return str(item)
