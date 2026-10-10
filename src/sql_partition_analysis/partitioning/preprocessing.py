@@ -6,9 +6,9 @@ leaves the statement intact so normal diagnostics can report the failure.
 """
 import re
 
-import sqlglot
 from sqlglot import exp
 from sqlglot.tokens import TokenType
+from .lexical import tokenize_postgres
 
 
 _QUOTED = {TokenType.IDENTIFIER, TokenType.STRING, TokenType.HEREDOC_STRING}
@@ -74,7 +74,7 @@ def sql_start_keyword(text):
     if end == cursor:
         return None
     try:
-        tokens = sqlglot.tokenize(text[cursor:end], read="postgres")
+        tokens = tokenize_postgres(text[cursor:end])
     except Exception:
         return None
     if len(tokens) == 1 and tokens[0].token_type not in _QUOTED:
@@ -272,7 +272,7 @@ def prepare_sql(text):
     if prepared != text:
         notes.append("仅解析时将日志\\x18换行标记还原为换行")
     try:
-        tokens = sqlglot.tokenize(prepared, read="postgres")
+        tokens = tokenize_postgres(prepared)
     except Exception:
         return prepared, notes
     edits, statement = [], []

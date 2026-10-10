@@ -28,6 +28,11 @@ _INTEGER_LIMITS = {exp.DataType.Type.SMALLINT: 2 ** 15,
 
 
 class _AuditPostgres(Postgres):
+    # Independently keep dollar-tag probes raw. A following terminal empty
+    # string must not make a positional parameter look like an unclosed tag.
+    class Tokenizer(Postgres.Tokenizer):
+        STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS = False
+
     # VALUES/APPLY may be relation aliases. Keep VALUES constructors intact;
     # stock PostgreSQL identifier rules already handle APPLY in other positions.
     class Parser(Postgres.Parser):
@@ -49,16 +54,16 @@ def _word(token, text):
 
 
 def _split(text):
-    tokens = sqlglot.tokenize(text, read='postgres')
+    tokens = sqlglot.tokenize(text, read=_AuditPostgres)
     parts, start = [], 0
     for token in tokens:
         if token.token_type == TokenType.SEMICOLON:
             part = text[start:token.start].strip()
-            if part and sqlglot.tokenize(part, read='postgres'):
+            if part and sqlglot.tokenize(part, read=_AuditPostgres):
                 parts.append(part)
             start = token.end + 1
     tail = text[start:].strip()
-    if tail and sqlglot.tokenize(tail, read='postgres'):
+    if tail and sqlglot.tokenize(tail, read=_AuditPostgres):
         parts.append(tail)
     return parts
 
@@ -71,7 +76,7 @@ def _parse_statement(text):
             return normalize_identifiers(tree, dialect='postgres')
     except sqlglot.errors.ParseError:
         tree = None
-    tokens = sqlglot.tokenize(text, read='postgres')
+    tokens = sqlglot.tokenize(text, read=_AuditPostgres)
     if not tokens or not _word(tokens[0], 'CREATE'):
         raise ValueError('unsupported_statement')
     depth, candidates = 0, []
@@ -404,7 +409,7 @@ def _update_tuple_values(node):
 
 def _ddl_signature(text):
     """Recognize a complete explicit partition object, using tokens only."""
-    tokens = sqlglot.tokenize(text, read='postgres')
+    tokens = sqlglot.tokenize(text, read=_AuditPostgres)
     if len(tokens) < 3 or tokens[0].text.upper() not in {'ADD', 'DROP', 'TRUNCATE', 'EXCHANGE', 'RENAME'}:
         return None
     action = tokens[0].text.upper()
@@ -432,7 +437,7 @@ def _ddl_signature(text):
             return None
         body = text[tokens[index].end + 1:tokens[end].start]
         try:
-            values = sqlglot.parse_one('SELECT ' + body, read='postgres').expressions
+            values = sqlglot.parse_one('SELECT ' + body, read=_AuditPostgres).expressions
         except sqlglot.errors.ParseError:
             return None
         values = [_constant(value) for value in values]
@@ -451,7 +456,7 @@ def _ddl_signature(text):
 
 
 def _alter(text, ordinal, config, skips):
-    tokens = sqlglot.tokenize(text, read='postgres')
+    tokens = sqlglot.tokenize(text, read=_AuditPostgres)
     if len(tokens) < 4 or not _word(tokens[0], 'ALTER') or not _word(tokens[1], 'TABLE'):
         return None
     index = 2
@@ -465,7 +470,7 @@ def _alter(text, ordinal, config, skips):
         index += 2
     name = text[tokens[first].start:tokens[index - 1].end + 1]
     try:
-        table = normalize_identifiers(sqlglot.parse_one('SELECT * FROM ' + name, read='postgres'), dialect='postgres').find(exp.Table)
+        table = normalize_identifiers(sqlglot.parse_one('SELECT * FROM ' + name, read=_AuditPostgres), dialect='postgres').find(exp.Table)
     except sqlglot.errors.ParseError:
         return None
     if table is None or not isinstance(table.this, exp.Identifier):
@@ -502,7 +507,7 @@ def _expectations(text, config):
         return [], {'empty_sql': 1}
     for statement_number, statement in enumerate(statements, 1):
         try:
-            tokens = sqlglot.tokenize(statement, read='postgres')
+            tokens = sqlglot.tokenize(statement, read=_AuditPostgres)
             if not tokens or tokens[0].text.upper() not in _SQL_WORDS:
                 skips['non_sql_statement'] += 1
                 continue

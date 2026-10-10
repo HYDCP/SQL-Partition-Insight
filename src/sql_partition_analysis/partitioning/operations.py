@@ -11,11 +11,12 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.tokens import TokenType
+from .lexical import tokenize_postgres
 from .parser import parse_one_postgres, recover_identifier_quote_encoding
 
 
 def _tokens(text):
-    return sqlglot.tokenize(text, read="postgres")
+    return tokenize_postgres(text)
 
 
 def _word(token, word):
