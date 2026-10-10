@@ -8,6 +8,7 @@ def aggregate_accesses(profile, analysis, catalog):
     import sqlglot
     from sqlglot import exp
     from sql_partition_analysis.partitioning.parser import parse_one_postgres
+    from sql_partition_analysis.partitioning.constants import value as constant_value, render_value as constant_text
     CONFIG = catalog.config
     partition_columns = catalog.partition_columns
     from sql_partition_analysis.partitioning.operations import describe_partition_action
@@ -40,6 +41,9 @@ def aggregate_accesses(profile, analysis, catalog):
      if isinstance(node,exp.Neg):
       value=literal(node.this)
       if value and value[0]=='number':return ('number',-value[1])
+     value=constant_value(node)
+     if isinstance(value,datetime.datetime):return ('timestamp',constant_text(value))
+     if isinstance(value,datetime.date):return ('date',value.isoformat())
      return None
 
     def literal_text(value):
@@ -74,9 +78,14 @@ def aggregate_accesses(profile, analysis, catalog):
      # and ISO dates; do not guess the ordering of arbitrary string partitions.
      if left[0]!=right[0]:return None
      if left[0]=='number':a,b=left[1],right[1]
+     elif left[0]=='date':
+      a,b=datetime.date.fromisoformat(left[1]),datetime.date.fromisoformat(right[1])
+     elif left[0]=='timestamp':
+      a,b=datetime.datetime.fromisoformat(left[1]),datetime.datetime.fromisoformat(right[1])
      elif left[0]=='string':
-      try:a,b=datetime.date.fromisoformat(left[1]),datetime.date.fromisoformat(right[1])
-      except ValueError:return None
+      # Unknown string literals are coerced by the field type and collation.
+      # Date-looking text must not silently acquire date ordering semantics.
+      return None
      else:return None
      return (a>b)-(a<b)
 
@@ -136,11 +145,26 @@ def aggregate_accesses(profile, analysis, catalog):
      for item in safe:fields[item['field']].append(item)
      options=[];complexes=[];additional=False
      for field,field_items in sorted(fields.items()):
-      allowed=None;remaining=[]
+      allowed=None;remaining=[];ambiguous_strings=False
+      value_types=set()
+      for item in field_items:
+       values=finite_values(parsed_condition(item),field)
+       if values is not None:value_types.update(value[0] for value in values)
+      if len(value_types)>1:
+       # Unknown column types can coerce an untyped string to a typed date or
+       # number. Different SQL literal representations do not prove a conflict.
+       complexes.extend(sorted({item['condition'] for item in field_items}));continue
       for item in field_items:
        node=parsed_condition(item);values=finite_values(node,field)
-       if values is not None:allowed=values if allowed is None else allowed & values
+       if values is not None:
+        if allowed is not None and allowed != values and 'string' in value_types:
+         # Even a nonempty raw intersection can drop values that are equal
+         # after the unknown column's input conversion or collation.
+         ambiguous_strings=True
+        allowed=values if allowed is None else allowed & values
        else:remaining.append((item,node))
+      if ambiguous_strings:
+       complexes.extend(sorted({item['condition'] for item in field_items}));continue
       if allowed is not None:
        uncertain_static=False
        for item,node in remaining:
@@ -232,7 +256,7 @@ def aggregate_accesses(profile, analysis, catalog):
     G={};MAP=[]
     # Only explicitly configured partitioned tables are statistical targets.
     # Keep all parsed sources upstream so joins/lineage retain their scope.
-    selected_details=[d for d in A['details'] if partition_columns(d['table'])]
+    selected_details=[d for d in A['details'] if partition_columns(d['table']) and d.get('statistics_eligible',True)]
     for d in selected_details:
      for candidate in partition(d):
       role,key,basis=candidate.role,candidate.condition,candidate.basis

@@ -24,6 +24,25 @@ def _inside(node, ancestor):
     return False
 
 
+def matches_table_reference(table, column):
+    """Match the visible relation name, honoring alias hiding and qualifiers."""
+    if not column.table:
+        return not column.db and not column.catalog
+    if table.alias:
+        return (column.table == table.alias and not column.db and not column.catalog)
+    return (column.table == table.name
+            and (not column.db or column.db == table.db)
+            and (not column.catalog or column.catalog == table.catalog))
+
+
+def resolve_direct_column(tables, column):
+    """Resolve a DML-local column only when one visible relation matches."""
+    matches = [table for table in tables if matches_table_reference(table, column)]
+    if len(matches) != 1:
+        return []
+    return [(matches[0], exp.Column(this=column.this.copy()), False)]
+
+
 class PartitionResolver:
     """Resolve safe local filters to ``(Table, Column, derived)`` tuples.
 
@@ -87,10 +106,7 @@ class PartitionResolver:
             reasons.append("多源或无源作用域中的未限定字段，归属不明确")
             return []
         if isinstance(source, exp.Table):
-            if column.db and (
-                source.db != column.db or source.name != column.table
-                or (column.catalog and source.catalog != column.catalog)
-            ):
+            if not matches_table_reference(source, column):
                 reasons.append("字段的全限定表名与当前来源不一致")
                 return []
             if source.args.get("sample"):

@@ -1,71 +1,20 @@
 """Extract SQL access evidence without file I/O or process-global configuration."""
 
 def analyze_profile(profile, catalog):
-    import re,collections,datetime,calendar
+    import re,collections
     partition_columns = catalog.partition_columns
     configured_columns = catalog.configured_columns
-    from sql_partition_analysis.partitioning.scope import PartitionResolver
-    from sql_partition_analysis.partitioning.operations import parse_alter, split_sql_statements, write_assignments, describe_partition_action
+    from sql_partition_analysis.partitioning.scope import PartitionResolver, resolve_direct_column
+    from sql_partition_analysis.partitioning.operations import parse_alter, split_sql_statements, write_assignments, describe_partition_action, recover_copy_header
     import sqlglot
     from sqlglot import exp
     from sqlglot.optimizer.scope import traverse_scope,Scope
     from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
-    from sql_partition_analysis.partitioning.parser import parse_postgres
+    from sql_partition_analysis.partitioning.parser import parse_postgres, prepare_sql, is_sql_statement, recover_identifier_quote_encoding
+    from sql_partition_analysis.partitioning.constants import value as val, render_value as datestr, normalize_expression as normalize
     P=profile
     SQLS={s['id']:s for s in P['sqls']}
     def sql(n):return n.sql(dialect='postgres',comments=False) if isinstance(n,exp.Expression) else str(n)
-    def date(s):
-     for fmt in ('%Y-%m-%d','%Y%m%d','%Y-%m-%d %H:%M:%S'):
-      try:return datetime.datetime.strptime(str(s),fmt).date()
-      except ValueError:pass
-     return None
-    def val(n):
-     if n is None:return None
-     if isinstance(n,exp.Paren):return val(n.this)
-     if isinstance(n,exp.Literal):
-      d=date(n.this)
-      if d:return d
-      if not n.is_string:
-       try:return int(n.this)
-       except:pass
-      return n.this
-     if isinstance(n,exp.Cast):
-      v=val(n.this)
-      return v if isinstance(v,datetime.date) or 'DATE' not in sql(n.args.get('to')).upper() else date(v)
-     if isinstance(n,(exp.StrToDate,exp.StrToTime)):return date(val(n.this))
-     if isinstance(n,exp.Date):return date(val(n.this))
-     if isinstance(n,(exp.DateTrunc,exp.TimestampTrunc)):
-      v=val(n.this); u=sql(n.args.get('unit')).strip("'").upper()
-      if isinstance(v,datetime.date):
-       if u=='MONTH':return v.replace(day=1)
-       if u=='YEAR':return v.replace(month=1,day=1)
-       if u=='DAY':return v
-     if isinstance(n,exp.Interval):
-      v=val(n.this);u=sql(n.args.get('unit')).upper()
-      try:return ('interval',int(v),u)
-      except:return None
-     if isinstance(n,(exp.Add,exp.Sub)):
-      a,b=val(n.this),val(n.expression);sign=-1 if isinstance(n,exp.Sub) else 1
-      if isinstance(a,datetime.date):
-       if isinstance(b,int):return a+datetime.timedelta(days=sign*b)
-       if isinstance(b,tuple):
-        k=sign*b[1];u=b[2]
-        if u in ('DAY','DAYS'):return a+datetime.timedelta(days=k)
-        if u in ('WEEK','WEEKS'):return a+datetime.timedelta(days=k*7)
-        if u in ('MONTH','MONTHS','YEAR','YEARS'):
-         m=a.year*12+a.month-1+k*(12 if u.startswith('YEAR') else 1);y,m=divmod(m,12);m+=1
-         return a.replace(year=y,month=m,day=min(a.day,calendar.monthrange(y,m)[1]))
-      if isinstance(a,int) and isinstance(b,int):return a+sign*b
-     if isinstance(n,exp.Anonymous) and n.name.lower() in ('date','to_date') and n.expressions:return date(val(n.expressions[0]))
-     return None
-    def datestr(v):return v.isoformat() if isinstance(v,datetime.date) else str(v)
-    def normalize(n):
-     def transform(x):
-      if not isinstance(x,(exp.Column,exp.Identifier,exp.DataType)):
-       v=val(x)
-       if isinstance(v,datetime.date):return exp.Literal.string(v.isoformat())
-      return x
-     return n.copy().transform(transform)
     def ident_name(t):
      # SQLGlot has already normalized unquoted identifiers. Keep identifier values,
      # not SQL rendering, so optional quotes do not split the same table's visits.
@@ -77,37 +26,55 @@ def analyze_profile(profile, catalog):
      if schema in ('pg_catalog','information_schema','gp_toolkit') or (not schema and name.startswith('pg_')):return '系统对象'
      if schema:return '显式schema对象'
      return '临时表候选/未指定schema'
-    def clean(s):
-     n=s.replace('\x18','\n');notes=[]
-     # Only remove a terminal Greenplum distribution clause, irrelevant to reads.
-     n,c=re.subn(r'\s*DISTRIBUTED\s+(?:BY\s*\([^;]*\)|RANDOMLY)\s*;?\s*$','',n,flags=re.I)
-     if c:notes.append('仅解析时移除末尾DISTRIBUTED子句')
-     if re.search(r'\b0END\b',n,re.I):n=re.sub(r'\b0END\b','0 END',n,flags=re.I);notes.append('仅解析时将0END分词为0 END')
-     if re.search(r'WHEN\s+IS\s+NOT\s+DISTINCT\s+FROM',n,re.I):
-      n=re.sub(r'WHEN\s+IS\s+NOT\s+DISTINCT\s+FROM','WHEN',n,flags=re.I);notes.append('仅兼容SELECT投影中的简单CASE语法，条件区未改动')
-     return n,notes
+    def parse_trees(text):
+     trees=[]
+     for statement in split_sql_statements(text):
+      alter=parse_alter(statement)
+      if alter is not None:trees.append(('alter',alter[0],alter[1]))
+      else:trees.extend(normalize_identifiers(t,dialect='postgres') for t in parse_postgres(statement) if t is not None)
+     return trees
     DETAIL=[];PRED=[];INDEX=[];UNRES=[]
     for s in P['sqls']:
-     raw=s['sql'];text,notes=clean(raw);sid=s['id'];stripped=re.sub(r'/\*[\s\S]*?\*/|--[^\n]*',' ',text).strip()
+     raw=s['sql'];sid=s['id'];statistics_eligible=True
+     wrapper=re.match(r'^\s*An exception was encountered during the execution of statement:\s*',raw,re.I)
+     body=raw[wrapper.end():] if wrapper else raw
+     text,notes=prepare_sql(body)
+     if wrapper:
+      statistics_eligible=False;notes.append('异常包装中的SQL证据；执行失败消息不纳入访问统计')
      meta={'id':sid,'status':'','notes':'; '.join(notes),'tables':[]}
-     if not re.match(r'^(select|with|create|insert|update|delete|copy|alter|drop|truncate|analyze|vacuum|comment|set|show|begin|commit|rollback|start|end|explain)\b',stripped,re.I):
+     if not statistics_eligible:meta['statistics_eligible']=False
+     if not is_sql_statement(text):
       meta['status']='非SQL日志消息';INDEX.append(meta);continue
      # Tokenize statements before dispatch: DDL must not consume a following query.
      try:
-      trees=[]
-      for statement in split_sql_statements(text):
-       alter=parse_alter(statement)
-       if alter is not None:
-        trees.append(('alter',alter[0],alter[1]))
-       else:
-        trees.extend(normalize_identifiers(t,dialect='postgres') for t in parse_postgres(statement) if t is not None)
+      trees=parse_trees(text)
      except Exception as e:
-      copy=re.match(r'^COPY\s+((?:"[^"]+"|[\w]+)(?:\.(?:"[^"]+"|[\w]+))*)\s*\(',stripped,re.I)
-      if copy:
-       t=normalize_identifiers(sqlglot.parse_one('SELECT * FROM '+copy[1],read='postgres'),dialect='postgres').find(exp.Table)
-       name=ident_name(t);DETAIL.append({'id':sid,'occurrence':1,'table':name,'category':category(t),'role':'COPY方向未知','alias':'','candidates':'','all_conditions':'','status':'SQL截断，COPY方向和分区值未知','notes':'仅识别完整目标表名，未补造缺失正文'})
-       meta['status']='部分解析（COPY截断）';meta['tables']=[name];meta['notes']='原文在字段列表中截断，仅提取目标表名';INDEX.append(meta);continue
-      meta['status']='解析失败';meta['notes']+='; '+re.sub(r'\x1b\[[0-9;]*m','',str(e))[:500];INDEX.append(meta);continue
+      recovered=recover_identifier_quote_encoding(text)
+      trees=None
+      if recovered is not None:
+       try:
+        recovered,recovery_notes=prepare_sql(recovered)
+        trees=parse_trees(recovered)
+        if not trees or any(isinstance(t,exp.Command) for t in trees):trees=None
+        else:
+         text=recovered;notes.extend(recovery_notes)
+         notes.append('仅解析时按完整标识符双重引号编码兼容还原；原始SQL保留')
+         meta['notes']='; '.join(dict.fromkeys(notes))
+       except Exception:trees=None
+      if trees is None:
+       copy=recover_copy_header(text)
+       if copy:
+        t,direction,incomplete=copy;name=ident_name(t)
+        if t.meta.get('identifier_quote_recovery'):
+         notes.append('仅解析时按完整COPY对象标识符双重引号编码兼容还原；截断字段列表和原始SQL保留')
+         meta['notes']='; '.join(dict.fromkeys(notes))
+        reason='字段列表或COPY头部未完整记录，方向和分区值未知' if incomplete else 'COPY语法未完全展开；仅保留完整目标和明确方向证据'
+        detail={'id':sid,'occurrence':1,'table':name,'category':category(t),'role':direction or 'COPY方向未知','alias':'','candidates':'','all_conditions':'','status':reason,'notes':'未补造数据正文；分区值未知'}
+        if not statistics_eligible:detail['statistics_eligible']=False
+        DETAIL.append(detail)
+        meta['status']='部分解析（COPY截断）' if incomplete else '部分解析（COPY语法）'
+        meta['tables']=[name];meta['notes']+='; '+reason;INDEX.append(meta);continue
+       meta['status']='解析失败';meta['notes']+='; '+re.sub(r'\x1b\[[0-9;]*m','',str(e))[:500];INDEX.append(meta);continue
      if any(isinstance(t,exp.Command) and t.name.upper() not in ('SHOW','SET','BEGIN','START','END') for t in trees):meta['status']='语法未展开'
      elif trees and all(isinstance(t,tuple) for t in trees):meta['status']='已解析（显式DDL）'
      else:meta['status']='已解析'
@@ -118,6 +85,7 @@ def analyze_profile(profile, catalog):
        name=ident_name(t)
        role='分区维护' if describe_partition_action(part,partition_columns(name)) is not None else '结构变更'
        det={'id':sid,'occurrence':occnum,'table':name,'category':category(t),'role':role,'alias':'','candidates':part if role=='分区维护' else '', 'all_conditions':part,'status':'显式分区操作' if role=='分区维护' else '结构操作','notes':''}
+       if not statistics_eligible:det['statistics_eligible']=False
        DETAIL.append(det);meta['tables'].append(name)
        if role=='分区维护' and partition_columns(name):PRED.append({'id':sid,'occurrence':occnum,'table':name,'category':category(t),'role':role,'field':'[显式分区]','condition':part,'raw':part,'origin':'ALTER TABLE','logic':'显式分区操作','value':'','status':'显式分区操作'})
        continue
@@ -149,6 +117,7 @@ def analyze_profile(profile, catalog):
        if isinstance(tree,exp.Drop):role='删除对象'
        if isinstance(tree,exp.Analyze):role='ANALYZE'
        d={'id':sid,'occurrence':occnum,'table':ident_name(t),'category':category(t),'role':role,'alias':t.alias_or_name,'candidates':[],'all_conditions':[],'status':'未发现候选条件','notes':[]}
+       if not statistics_eligible:d['statistics_eligible']=False
        if not t.db:d['notes'].append('SQL未指定schema，保留原样，不自动补全')
        detmap[id(t)]=d
       # Field lineage is only used as a filter when crossing scopes is safe.
@@ -158,8 +127,7 @@ def analyze_profile(profile, catalog):
       def resolve_col(scope,node,c):
        if scope:return resolve(scope,c)
        direct=[t for t in tables if owner(t) is node]
-       if c.table:direct=[t for t in direct if t.alias_or_name==c.table or t.name==c.table]
-       return [(direct[0],c.copy(),False)] if len(direct)==1 else []
+       return resolve_direct_column(direct,c)
       atomtypes=(exp.EQ,exp.NEQ,exp.GT,exp.GTE,exp.LT,exp.LTE,exp.Between,exp.In,exp.Is,exp.Like,exp.ILike)
       for container in tree.walk():
        cond=container.this if isinstance(container,(exp.Where,exp.Having)) else container.args.get('on') if isinstance(container,exp.Join) else None

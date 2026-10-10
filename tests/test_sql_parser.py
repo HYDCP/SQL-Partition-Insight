@@ -21,10 +21,12 @@ class ParserCompatibilityTests(unittest.TestCase):
 
     def test_negative_month_arithmetic_in_complete_pipeline(self):
         helper = pipeline_tests.PartitionConfigurationTests()
-        _, result = helper.run_pipeline({'s.events': {'partition_columns': ['data_dt']}}, [helper.record(
+        analysis, result = helper.run_pipeline({'s.events': {'partition_columns': ['data_dt']}}, [helper.record(
             "SELECT * FROM s.events WHERE data_dt = DATE '2026-06-30' + INTERVAL '1 DAY' "
             "+ INTERVAL '-1 MONTH' + INTERVAL '-1 DAY'")])
-        self.assertEqual(result['results'][0]['partition'], 'data_dt=2026-05-31')
+        # PostgreSQL DATE + INTERVAL returns TIMESTAMP; preserve its time/type.
+        self.assertEqual(result['results'][0]['partition'], 'data_dt=2026-05-31 00:00:00')
+        self.assertIn('AS TIMESTAMP', analysis['predicates'][0]['condition'])
         self.assertEqual(result['results'][0]['count'], 3)
 
     def test_projection_cast_does_not_drop_table_access(self):

@@ -25,10 +25,12 @@ def export_processed_reports(profile, analysis, aggregate, observations, output_
     import csv,json,collections,re,gzip
     from pathlib import Path
     from .access_data import AccessDatasetWriter
+    from .sql_partitions import export_sql_partitions
     R=Path(output_path)
     G=deepcopy(aggregate);A=deepcopy(analysis);P=profile;S={s['id']:s for s in P['sqls']}
     selected_tables={r['table'] for r in G['results']};selected_ids={sid for r in G['results'] for sid in r['ids']}
-    A['details']=[d for d in A['details'] if d['table'] in selected_tables]
+    A['details']=[d for d in A['details'] if d['table'] in selected_tables
+                  and d['id'] in selected_ids and d.get('statistics_eligible',True)]
     A['index']=[dict(x,tables=[t for t in x['tables'] if t in selected_tables]) for x in A['index'] if x['id'] in selected_ids]
     A['unresolved']=[row for row in A['unresolved'] if row[0] in selected_ids]
     def write(name,head,rows):
@@ -130,5 +132,6 @@ def export_processed_reports(profile, analysis, aggregate, observations, output_
      c=check[r['group_id']]
      if (c['n'],c['first'],c['last'])!=(r['count'],r['first'],r['last']):
       raise ValueError('逐条访问证据与统计组不一致：'+r['group_id'])
+    export_sql_partitions(P,analysis,G,R)
     access_data.finish()
     return G

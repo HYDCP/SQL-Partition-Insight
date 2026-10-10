@@ -28,6 +28,7 @@ from sql_partition_analysis.mysql_pipeline import run_mysql_analysis
 from sql_partition_analysis.partitioning.analyzer import analyze_profile
 from sql_partition_analysis.partitioning.catalog import PartitionCatalog
 from sql_partition_analysis.pipeline import DELIVERABLES, run
+from sql_partition_analysis.reporting.sql_partitions import OUTPUT_NAME
 
 
 def plain(value):
@@ -57,6 +58,14 @@ def verify_outputs(output, oracle, catalog_path):
     summary = load(output / 'run_summary.json')
     check(summary['status'] == 'complete', 'Run not complete')
     check(summary['source_rows'] == sum(r['count'] for r in oracle.values()), 'Source row count differs')
+    with (output / OUTPUT_NAME).open(encoding='utf-8') as stream:
+        recognition = [json.loads(line) for line in stream]
+    check([r['sql_id'] for r in recognition] == [r['id'] for r in profile['sqls']],
+          'Default JSONL does not contain every SQL/user context')
+    check(sum(r['log_count'] for r in recognition) == summary['source_rows'],
+          'Default JSONL log counts differ')
+    check(all(r['sql'] == p['sql'] and r['user_name'] == p['user_name']
+              for r, p in zip(recognition, profile['sqls'])), 'Default JSONL SQL/user differs')
     for name in ('源日志.csv', '源日志.csv.part', '.mysql_observations.jsonl.gz',
                  'profile.py.log', 'parallel_analyze.py.log', 'aggregate.py.log',
                  'export_data.py.log', '.analysis_workers'):
@@ -79,6 +88,7 @@ def verify_outputs(output, oracle, catalog_path):
     with zipfile.ZipFile(output / '统计结果.zip') as archive:
         check(archive.testzip() is None, 'Result archive corrupted')
         check(set(archive.namelist()) == set(DELIVERABLES), 'Archive deliverables differ')
+        check(OUTPUT_NAME not in archive.namelist(), 'Default JSONL must remain outside the ZIP')
     return {'source_rows': summary['source_rows'], 'contexts': len(profile['sqls']),
             'groups': summary['groups'], 'observations': sum(counts.values()),
             'disk_bytes': sum(p.stat().st_size for p in output.rglob('*') if p.is_file()),

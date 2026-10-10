@@ -43,6 +43,14 @@ MySQL 在内存中保存不同 SQL/用户组合及其解析结果；原始 33 �
 
 另输出 `access_targets.jsonl`（访问对象）、`access_observations.jsonl.gz`（逐条访问时间及对象关联）、`access_manifest.json`（数据版本及来源），供后续热点和未访问天数分析复用。仅使用 `run_summary.json` 中 `status=complete` 的结果；分区条件尚不等同于物理分区，日志连续覆盖情况标为未知。
 
+CSV 和 MySQL 每次分析默认在本次运行目录生成 `逐条SQL分区识别.jsonl`。每行是一个 SQL/日志用户名组合，包含 SQL 正文、出现次数、解析状态、表引用、识别出的分区条件和判断依据，也保留未纳入统计的 SQL 及排除原因。重复日志通过 `log_count` 累计，分区条件仍表示 SQL 证据。
+
+该文件复用本次解析结果，不额外读取源日志或重新解析。JSONL 单独保存在运行目录，不加入 `统计结果.zip`；仅使用 `run_summary.json` 中 `status=complete` 的运行结果。
+
+解析兼容 Greenplum 建表尾部的 `DISTRIBUTED BY / RANDOMLY / REPLICATED` 和 `values` 别名，按语法位置处理，保留注释及字符串内容。日志中的完整标识符双重引号编码仅在原文解析失败时尝试兼容还原，并记录依据；JSONL 中仍保存原始 SQL。COPY 正文缺失时只保留明确的对象和读写方向，分区值保持未知。
+
+常量求值保留 SQL 类型：未声明类型的日期形字符串不自动改写日期；明确的 DATE、无时区 TIMESTAMP 和受支持的转换格式按其语义求值，时间部分不会丢失。依赖字段类型、排序规则、DateStyle 或 TimeZone 的表达式保留完整条件，不据此判定分区冲突。异常执行消息中的 SQL 也保留识别证据，但不计入访问统计。
+
 ## 分区清单
 
 原始清单（如 `query_result.txt`）需为 CSV 格式，表头为 `SCHEMA_NAME,TAB_NAME,TAB_PARTI_FIELD`；分区定义为 `NULL` 的表不参与统计。

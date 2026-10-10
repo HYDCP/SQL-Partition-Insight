@@ -97,9 +97,9 @@ class PartitionAggregationSemanticsTests(unittest.TestCase):
                 "AND data_dt >= DATE '2026-09-02' AND data_dt < DATE '2026-09-03'")])
         self.assertEqual(set(self.rows(aggregate)), {'data_dt=2026-09-02'})
         for condition in [
-                "data_dt='2026-09-01' AND data_dt > '2026-09-02'",
-                "data_dt='2026-09-01' AND data_dt='2026-09-02'",
-                "data_dt IN ('2026-09-01') AND data_dt IN ('2026-09-02')"]:
+                "data_dt=DATE '2026-09-01' AND data_dt > DATE '2026-09-02'",
+                "data_dt=DATE '2026-09-01' AND data_dt=DATE '2026-09-02'",
+                "data_dt IN (DATE '2026-09-01') AND data_dt IN (DATE '2026-09-02')"]:
             with self.subTest(condition=condition):
                 _, aggregate = self.run_pipeline(
                     {'s.events': {'partition_columns': ['data_dt']}},

@@ -5,12 +5,13 @@ successful row writes. Unsupported syntax keeps its text instead of guessing.
 """
 
 import datetime
+import re
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.tokens import TokenType
-from .parser import parse_one_postgres
+from .parser import parse_one_postgres, recover_identifier_quote_encoding
 
 
 def _tokens(text):
@@ -44,6 +45,149 @@ def split_sql_statements(text):
     if tail and _tokens(tail):
         result.append(tail)
     return result
+
+
+def recover_copy_header(text):
+    """Keep a complete COPY relation/direction even if its options fail parsing.
+
+    Returns (Table, direction, incomplete_header).  FROM writes, TO reads.
+    Direction is taken only immediately after the relation's optional balanced
+    column list. Words inside literals or column identifiers are never evidence.
+    """
+    try:
+        tokens = _tokens(text)
+    except Exception:
+        # Tokenize only the complete lexical prefix. A broken option string
+        # after FROM/TO must not erase an already complete COPY header.
+        try:
+            tokens = _tokens(_complete_lexical_prefix(text))
+        except Exception:
+            return None
+    if len(tokens) < 2 or not _word(tokens[0], 'COPY') or tokens[1].token_type == TokenType.L_PAREN:
+        return None
+    index = 2
+    while index + 1 < len(tokens) and tokens[index].token_type == TokenType.DOT:
+        index += 2
+    if index < len(tokens) and tokens[index].token_type == TokenType.DOT:
+        # A qualified target may have more components after the final dot.
+        # Its shorter prefix is not evidence of a complete relation.
+        return None
+    name = text[tokens[1].start:tokens[index - 1].end + 1]
+    try:
+        table = normalize_identifiers(sqlglot.parse_one('SELECT * FROM ' + name, read='postgres'), dialect='postgres').find(exp.Table)
+        if table is None or not isinstance(table.this, exp.Identifier):
+            return None
+        if not all(part.name for part in table.parts):
+            # An encoded relation begins with an empty quoted token in the
+            # normal lexer. Recover only its complete head, never a truncated
+            # field list or data body. The caller must expose this assumption.
+            boundary = _copy_relation_end(tokens, text)
+            head = recover_identifier_quote_encoding(text[:boundary]) if boundary is not None else None
+            if head is None:
+                return None
+            recovered = recover_copy_header(head + text[boundary:])
+            if recovered is not None:
+                recovered[0].meta['identifier_quote_recovery'] = True
+            return recovered
+    except Exception:
+        return None
+    if index < len(tokens) and tokens[index].token_type == TokenType.L_PAREN:
+        group = _parenthesized(text, tokens, index)
+        if group is None:
+            return table, None, True
+        index = group[1]
+    if index >= len(tokens) or tokens[index].token_type == TokenType.SEMICOLON:
+        return table, None, True
+    if _word(tokens[index], 'FROM'):
+        return table, 'COPY写入', False
+    if _word(tokens[index], 'TO'):
+        return table, 'COPY读取', False
+    return table, None, False
+
+
+def _copy_relation_end(tokens, text):
+    """Locate a complete relation without reading words inside encoded names."""
+    index, end = 1, None
+    while index < len(tokens):
+        token = tokens[index]
+        if token.token_type == TokenType.IDENTIFIER and not token.text:
+            frame = re.match(r'""[^"\x00]+""(?!")', text[token.start:])
+            if frame is None:
+                return None
+            end = token.start + frame.end()
+            if end < len(text) and (text[end].isalnum() or text[end] in '_$"'):
+                return None
+            fragment = text[token.start:end]
+            if recover_identifier_quote_encoding(fragment) is None:
+                return None
+            while index < len(tokens) and tokens[index].end < end:
+                index += 1
+        elif (token.token_type == TokenType.IDENTIFIER
+              or token.token_type not in (TokenType.STRING, TokenType.HEREDOC_STRING)
+              and re.fullmatch(r'[^\W\d][\w$]*', token.text, re.UNICODE)):
+            end, index = token.end + 1, index + 1
+        else:
+            return None
+        if index >= len(tokens) or tokens[index].token_type != TokenType.DOT:
+            return end
+        index += 1
+    return None
+
+
+def _complete_lexical_prefix(text):
+    """Stop before an unfinished quote/comment, preserving complete tokens.
+
+    This recovery does not repair SQL. Its sole purpose is to let the COPY
+    header parser inspect evidence preceding a malformed trailing token.
+    """
+    index, size = 0, len(text)
+    while index < size:
+        start = index
+        if text.startswith('--', index):
+            end = text.find('\n', index + 2)
+            index = size if end < 0 else end + 1
+        elif text.startswith('/*', index):
+            depth, index = 1, index + 2
+            while index < size and depth:
+                if text.startswith('/*', index):
+                    depth, index = depth + 1, index + 2
+                elif text.startswith('*/', index):
+                    depth, index = depth - 1, index + 2
+                else:
+                    index += 1
+            if depth:
+                return text[:start]
+        elif text[index] in ('\"', "'"):
+            quote = text[index]
+            escaped = quote == "'" and index > 0 and text[index - 1] in 'eE' and (
+                index == 1 or not (text[index - 2].isalnum() or text[index - 2] in '_$'))
+            index += 1
+            while index < size:
+                if escaped and text[index] == '\\':
+                    index += 2
+                elif text[index] == quote:
+                    if index + 1 < size and text[index + 1] == quote:
+                        index += 2
+                    else:
+                        index += 1
+                        break
+                else:
+                    index += 1
+            else:
+                return text[:start - 1 if escaped else start]
+        elif text[index] == '$' and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] in '_$')):
+            match = re.match(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$', text[index:])
+            if match:
+                marker = match.group()
+                end = text.find(marker, index + len(marker))
+                if end < 0:
+                    return text[:start]
+                index = end + len(marker)
+            else:
+                index += 1
+        else:
+            index += 1
+    return text
 
 
 def parse_alter(text):
