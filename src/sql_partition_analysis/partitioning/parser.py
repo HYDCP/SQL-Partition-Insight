@@ -46,7 +46,7 @@ def _preserve_function_arguments(name, builder, supported_count, template_index=
 
 
 class CompatiblePostgres(Postgres):
-    """Accept Greenplum's unreserved VALUES in identifier alias contexts.
+    """Accept unreserved VALUES/APPLY in PostgreSQL table alias contexts.
 
     Columns are already handled by PostgreSQL's VALUES_FOLLOWED_BY_PAREN rule.
     Do not add VALUES to generic ID_VAR_TOKENS: the statement/expression parser
@@ -54,7 +54,9 @@ class CompatiblePostgres(Postgres):
     """
     class Parser(Postgres.Parser):
         ALIAS_TOKENS = Postgres.Parser.ALIAS_TOKENS | {TokenType.VALUES}
-        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.VALUES}
+        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {
+            TokenType.VALUES, TokenType.APPLY}
+        UPDATE_ALIAS_TOKENS = Postgres.Parser.UPDATE_ALIAS_TOKENS | {TokenType.APPLY}
         FUNCTIONS = dict(Postgres.Parser.FUNCTIONS)
         # The pinned builders read only arguments[0:2], while their AST classes
         # have optional zone/safe fields that let a third input pass validation.
@@ -84,8 +86,13 @@ def compatible_postgres(sql):
         if token.token_type == TokenType.INTERVAL:
             match = _INTERVAL.fullmatch(literal.text.strip())
             if match:
+                # A closing quote itself separates a following keyword/alias.
+                # Moving the unit outside that quote must retain the boundary:
+                # INTERVAL '1 DAY'as date must not become INTERVAL '1' DAYas.
+                # One space also preserves non-ASCII identifier boundaries,
+                # whose PostgreSQL characters need not satisfy str.isalnum().
                 edits.append((literal.start, literal.end + 1,
-                              "'{}' {}".format(match[1], match[2].upper())))
+                              "'{}' {} ".format(match[1], match[2].upper())))
         elif token.token_type == TokenType.DATE and index + 2 < len(tokens):
             if tokens[index + 2].token_type == TokenType.DCOLON:
                 edits.append((token.start, literal.end + 1,

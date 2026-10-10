@@ -28,11 +28,13 @@ _INTEGER_LIMITS = {exp.DataType.Type.SMALLINT: 2 ** 15,
 
 
 class _AuditPostgres(Postgres):
-    # Greenplum permits VALUES as a relation alias. Keep VALUES constructors
-    # intact; the stock PostgreSQL identifier rules handle column positions.
+    # VALUES/APPLY may be relation aliases. Keep VALUES constructors intact;
+    # stock PostgreSQL identifier rules already handle APPLY in other positions.
     class Parser(Postgres.Parser):
         ALIAS_TOKENS = Postgres.Parser.ALIAS_TOKENS | {TokenType.VALUES}
-        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {TokenType.VALUES}
+        TABLE_ALIAS_TOKENS = Postgres.Parser.TABLE_ALIAS_TOKENS | {
+            TokenType.VALUES, TokenType.APPLY}
+        UPDATE_ALIAS_TOKENS = Postgres.Parser.UPDATE_ALIAS_TOKENS | {TokenType.APPLY}
 
         def _parse_alias(self, this, explicit=False):
             if this is None and self._curr and self._curr.token_type == TokenType.VALUES:

@@ -142,6 +142,33 @@ class PartitionOmissionTests(unittest.TestCase):
         legitimate = 'CREATE TABLE s.target AS SELECT * FROM s.distributed randomly'
         self.assertEqual(self.check(legitimate)['metrics']['expected_accesses'], 0)
 
+    def test_apply_table_alias_is_checked_without_main_parser(self):
+        sql = 'SELECT * FROM s.events apply WHERE apply.data_dt=1'
+        checked = self.check(sql)
+        self.assertEqual(checked['metrics']['expected_accesses'], 1)
+        self.assertEqual(checked['alerts'][0]['reference'], 'apply')
+        self.assertNotIn('unparseable_original_sql', checked['metrics']['skip_reason_counts'])
+        self.assertFalse(self.check(sql, output([('number', '1')]))['alerts'])
+        update = 'UPDATE s.events apply SET data_dt=2 WHERE apply.data_dt=1'
+        old_only = output([('number', '1')], role='UPDATE更新')
+        alerts = self.check(update, old_only)['alerts']
+        self.assertEqual([alert['partition_value']['value'] for alert in alerts], ['2'])
+        self.assertEqual(alerts[0]['origin'], 'UPDATE SET')
+        with patch('sql_partition_analysis.partitioning.parser.parse_one_postgres',
+                   side_effect=AssertionError('main parser must not be called')):
+            self.assertFalse(self.check(sql, output([('number', '1')]))['alerts'])
+
+    def test_apply_identifier_contexts_do_not_hide_values_rows(self):
+        sql = 'SELECT apply.data_dt FROM s.events apply WHERE apply.data_dt=1'
+        self.assertFalse(self.check(sql, output([('number', '1')]))['alerts'])
+        inserted = 'INSERT INTO s.events(data_dt) VALUES (1),(2)'
+        self.assertFalse(self.check(inserted, output([('number', '1'), ('number', '2')],
+                                                    role='INSERT写入'))['alerts'])
+        sql = 'SELECT * FROM (VALUES (1),(2)) apply(data_dt)'
+        checked = self.check(sql)
+        self.assertFalse(checked['alerts'])
+        self.assertNotIn('unparseable_original_sql', checked['metrics']['skip_reason_counts'])
+
     def test_explicit_partition_objects_are_checked(self):
         sql = 'ALTER TABLE s.events TRUNCATE PARTITION p20261007'
         report = output([], role='ALTER清空分区')
