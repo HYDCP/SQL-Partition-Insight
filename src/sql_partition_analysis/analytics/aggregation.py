@@ -40,7 +40,7 @@ def aggregate_accesses(profile, analysis, catalog):
      if isinstance(node,exp.Boolean):return ('boolean',node.this)
      if isinstance(node,exp.Neg):
       value=literal(node.this)
-      if value and value[0]=='number':return ('number',-value[1])
+      if value and value[0]=='number':return ('number',value[1].copy_negate())
      value=constant_value(node)
      if isinstance(value,datetime.datetime):return ('timestamp',constant_text(value))
      if isinstance(value,datetime.date):return ('date',value.isoformat())

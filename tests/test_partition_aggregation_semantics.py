@@ -114,6 +114,20 @@ class PartitionAggregationSemanticsTests(unittest.TestCase):
                 "SELECT * FROM s.events WHERE region IN ('east,west','O''Reilly','east,west')")])
         self.assertEqual(set(self.rows(aggregate)), {'region=east,west', "region=O'Reilly"})
 
+    def test_negative_decimal_partitions_remain_exact_and_distinct(self):
+        values = ['-123456789012345678901234567890.123',
+                  '-123456789012345678901234567890.124']
+        _, aggregate = self.run_pipeline(
+            {'s.events': {'partition_columns': ['data_dt']}}, [
+                self.record('SELECT * FROM s.events WHERE data_dt=' + text)
+                for text in values])
+        rows = list(self.rows(aggregate).values())
+        self.assertEqual({row['partition'] for row in rows},
+                         {'data_dt=' + text for text in values})
+        self.assertEqual({tuple(row['partition_identity'][1][0]) for row in rows},
+                         {('data_dt', 'number', text) for text in values})
+        self.assertEqual([row['count'] for row in rows], [3, 3])
+
     def test_composite_candidate_identity_preserves_literal_boundaries(self):
         from sql_partition_analysis.domain.access import AccessTarget
         _, aggregate = self.run_pipeline(

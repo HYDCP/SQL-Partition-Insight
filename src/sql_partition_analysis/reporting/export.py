@@ -26,6 +26,7 @@ def export_processed_reports(profile, analysis, aggregate, observations, output_
     from pathlib import Path
     from .access_data import AccessDatasetWriter
     from .sql_partitions import export_sql_partitions
+    from .partition_alerts import export_partition_omissions
     R=Path(output_path)
     G=deepcopy(aggregate);A=deepcopy(analysis);P=profile;S={s['id']:s for s in P['sqls']}
     selected_tables={r['table'] for r in G['results']};selected_ids={sid for r in G['results'] for sid in r['ids']}
@@ -96,6 +97,7 @@ def export_processed_reports(profile, analysis, aggregate, observations, output_
      r['raw_partition']=r['partition']
      r['partition']=partition_display(r['table'],r['partition'],r['role'])
      r['basis']=basis_display(r['table'],r['basis'])
+    G['partition_omission_check']=export_partition_omissions(P,G,R,progress)
     write('表分区访问统计.csv',['统计组ID','表名','表分区信息','分区或完整条件','访问类型','访问次数','平均访问间隔_秒','首次访问_CST','最后访问_CST','对象类别','判断依据','SQL编号','解析条件或分区操作'],[[r['group_id'],r['table'],r['table_partition_info'],r['partition'],r['role'],r['count'],r['mean_seconds'] if r['mean_seconds'] is not None else '',r['first'],r['last'],r['category'],r['basis'],','.join(r['ids']),r['raw_partition']] for r in G['results']])
     write('SQL解析明细.csv',['SQL编号','表引用编号','表名','访问类型','配置分区字段条件或分区操作','完整WHERE和JOIN条件','解析备注','日志用户名'],[[d['id'],d['occurrence'],d['table'],d['role'],d['candidates'],d['all_conditions'],d['notes'],S[d['id']].get('user_name','')] for d in A['details']])
     write('SQL原文索引.csv',['SQL编号','日志条数_未去重','首次数据记录序号','首次时间','最后时间','日志语句类型','解析状态','解析说明','原始SQL正文','日志用户名'],[[x['id'],S[x['id']]['count'],S[x['id']]['first_record'],S[x['id']]['first_time'],S[x['id']]['last_time'],','.join(S[x['id']]['types']),x['status'],x['notes'],S[x['id']]['sql'].replace('\x18','\n'),S[x['id']].get('user_name','')] for x in A['index']])

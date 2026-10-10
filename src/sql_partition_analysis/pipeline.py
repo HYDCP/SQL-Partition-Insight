@@ -16,6 +16,7 @@ from .paths import PROJECT_ROOT, REPORTING_ROOT, resolve_path, remove_if_exists,
 from .ingestion.mysql import mysql_tables
 from .mysql_pipeline import run_mysql_analysis
 from .reporting.access_data import ACCESS_FILES
+from .reporting.partition_alerts import CHECK_NAME
 
 DELIVERABLES = ['表分区访问统计.csv', 'SQL解析明细.csv', 'SQL原文索引.csv',
                 '待确认字段.csv', '逐条日志统计映射.csv.gz', '表分区配置核对.csv',
@@ -110,6 +111,9 @@ def run(config_path, check_only=False, source_type=None):
             if (original_stat.st_size, original_stat.st_mtime_ns) != (current_stat.st_size, current_stat.st_mtime_ns):
                 raise RuntimeError('处理期间输入 CSV 发生变化，本次结果不可用，请重跑')
             metrics = json.loads((output / 'aggregate.json').read_text(encoding='utf-8'))['metrics']
+        omission_check=json.loads((output / CHECK_NAME).read_text(encoding='utf-8'))
+        summary.update(partition_omission_alerts=omission_check['alert_count'],
+                       partition_omission_check_file=CHECK_NAME)
         if node:
             print('正在生成 Excel', flush=True)
             with (output / 'build_report.log').open('w', encoding='utf-8') as log:

@@ -29,6 +29,7 @@ from sql_partition_analysis.partitioning.analyzer import analyze_profile
 from sql_partition_analysis.partitioning.catalog import PartitionCatalog
 from sql_partition_analysis.pipeline import DELIVERABLES, run
 from sql_partition_analysis.reporting.sql_partitions import OUTPUT_NAME
+from sql_partition_analysis.reporting.partition_alerts import ALERTS_NAME, CHECK_NAME
 
 
 def plain(value):
@@ -66,6 +67,19 @@ def verify_outputs(output, oracle, catalog_path):
           'Default JSONL log counts differ')
     check(all(r['sql'] == p['sql'] and r['user_name'] == p['user_name']
               for r, p in zip(recognition, profile['sqls'])), 'Default JSONL SQL/user differs')
+    omission_check = load(output / CHECK_NAME)
+    alerts = [json.loads(line) for line in (output / ALERTS_NAME).read_text(encoding='utf-8').splitlines()]
+    check(not alerts, 'Known-good Doris inputs produced omission warnings')
+    check(omission_check['metrics']['sql_contexts'] == len(profile['sqls']),
+          'Omission checker did not inspect every SQL/user context')
+    check(omission_check['metrics']['source_logs'] == summary['source_rows'],
+          'Omission coverage log count differs')
+    check(omission_check['alert_count'] == summary['partition_omission_alerts'] == len(alerts),
+          'Omission alert counts differ')
+    check(summary['partition_omission_check_file'] == CHECK_NAME,
+          'Run summary does not identify omission coverage file')
+    check(load(output / 'report_data.json')['partition_omission_check'] == omission_check,
+          'Report data and omission coverage summary differ')
     for name in ('源日志.csv', '源日志.csv.part', '.mysql_observations.jsonl.gz',
                  'profile.py.log', 'parallel_analyze.py.log', 'aggregate.py.log',
                  'export_data.py.log', '.analysis_workers'):
@@ -89,8 +103,15 @@ def verify_outputs(output, oracle, catalog_path):
         check(archive.testzip() is None, 'Result archive corrupted')
         check(set(archive.namelist()) == set(DELIVERABLES), 'Archive deliverables differ')
         check(OUTPUT_NAME not in archive.namelist(), 'Default JSONL must remain outside the ZIP')
+        check(not {ALERTS_NAME, CHECK_NAME}.intersection(archive.namelist()),
+              'Omission diagnostics must remain outside the ZIP')
+        archived_summary = json.loads(archive.read('run_summary.json'))
+        check(archived_summary['partition_omission_alerts'] == len(alerts),
+              'Archived run summary alert count differs')
     return {'source_rows': summary['source_rows'], 'contexts': len(profile['sqls']),
             'groups': summary['groups'], 'observations': sum(counts.values()),
+            'partition_omission_alerts': len(alerts),
+            'omission_supported_contexts': omission_check['metrics']['supported_sql_contexts'],
             'disk_bytes': sum(p.stat().st_size for p in output.rglob('*') if p.is_file()),
             'output': str(output), 'checks': 'passed'}
 

@@ -313,7 +313,9 @@ def value(node):
             item = value(node.this)
             if isinstance(item, Interval):
                 return Interval(*(-part for part in item))
-            return -item if isinstance(item, (int, Decimal)) else None
+            if isinstance(item, Decimal):
+                return item.copy_negate()
+            return -item if isinstance(item, int) else None
         if isinstance(node, (exp.Add, exp.Sub)):
             return _arithmetic(node)
     except (ValueError, TypeError, OverflowError, InvalidOperation):

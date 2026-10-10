@@ -29,6 +29,11 @@ class PartitionConstantsTests(unittest.TestCase):
                 self.assertIs(type(value(node)), type(expected))
                 self.assertEqual(normalize_expression(node).sql(), node.sql())
 
+    def test_negative_decimal_preserves_all_literal_digits(self):
+        text = '-123456789012345678901234567890.123'
+        self.assertEqual(self.evaluate(text), Decimal(text))
+        self.assertEqual(render_value(self.evaluate(text)), text)
+
     def test_explicit_date_and_integer_arithmetic(self):
         for text in ("DATE '20260901'", "CAST('2026-09-01' AS DATE)", "DATE('20260901')"):
             self.assertEqual(self.evaluate(text), datetime.date(2026, 9, 1))
